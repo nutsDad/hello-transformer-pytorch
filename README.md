@@ -1,237 +1,463 @@
 # Hello Transformer PyTorch
 
-一个面向学习、实验和小规模训练的 PyTorch Transformer 项目。它同时保留了英译中的 Encoder-Decoder Transformer，并提供完整的 **Decoder-only 自回归语言模型**：可在 Windows CPU 上运行，也可通过配置切换到 CUDA GPU 服务器训练和推理。
+一个面向大模型训练与推理初学者的 PyTorch Transformer 项目。项目保留英文到中文的 Encoder-Decoder 翻译模型，并提供完整的 Decoder-only 自回归语言模型：支持数据准备、训练、评估、断点续训、KV Cache 批量生成和 HTTP 推理服务。
 
-项目默认安全地运行在 CPU。训练、评估、检查点、实验日志和推理服务均由同一份配置驱动，便于从本地验证迁移到 GPU 环境。
+默认运行环境是 Windows CPU，不需要显卡；也可通过配置切换到有 CUDA 的 GPU 服务器。本项目适合理解从语料到 token、从 loss 到 checkpoint、从 prompt 到生成结果的完整链路。
 
-## 功能概览
+## 目录
 
-| 架构 | 配置值 | 用途 | 训练目标 | 推理方式 |
+1. 项目功能
+2. 核心概念
+3. 五分钟跑通
+4. 安装环境
+5. 配置系统
+6. 数据准备
+7. Decoder-only 训练与评估
+8. Decoder-only 生成与服务
+9. Encoder-Decoder 翻译
+10. 实验产物、测试与排错
+11. 项目结构与限制
+
+## 项目功能
+
+| 功能 | 说明 | 主要入口 |
+| --- | --- | --- |
+| Decoder-only 训练 | 学习根据历史 token 预测下一个 token | main.py --action train |
+| Decoder-only 评估 | 输出 token loss 与 perplexity | main.py --action evaluate |
+| 单条续写 | 贪心解码或 top-k 采样 | translate.py |
+| 批量续写 | 多条 prompt 一次推理，生成阶段复用 KV Cache | translate.generate_texts |
+| HTTP 推理 | FastAPI 健康检查和批量生成接口 | serve.py |
+| 数据治理 | 文本规范化、空文本和短文本过滤、精确去重、统计 | tools/data_loader.py |
+| 数据切分 | 固定随机种子生成 train、dev、test | tools/prepare_lm_data.py |
+| 可复现实验 | 固定随机源、配置快照、JSONL 指标、TensorBoard | tools/experiment.py |
+| 断点续训 | 恢复模型、Adam、Noam 学习率状态和 epoch | TRANSFORMER_RESUME_CHECKPOINT |
+| 英译中 | Encoder-Decoder 训练、BLEU 评估、Beam Search | main.py、translate.py |
+
+支持两种架构：
+
+| 架构 | 配置值 | 适用任务 | 训练目标 | 推理方式 |
 | --- | --- | --- | --- | --- |
-| Encoder-Decoder | `encoder_decoder` | 英文到中文翻译 | 目标句 token 预测 | Beam Search |
-| Decoder-only | `decoder_only` | 续写与语言模型实验 | 下一个 token 预测 | 贪心解码或 top-k 采样 |
+| Encoder-Decoder | encoder_decoder | 英文到中文翻译 | 根据源句预测目标句 | Beam Search |
+| Decoder-only | decoder_only | 续写和语言模型实验 | 根据历史预测下一个 token | 贪心、top-k、KV Cache |
 
-`encoder_only` 分类/句向量模式已被移除并替换为 `decoder_only`。以前保存的 `encoder_only` 检查点与新架构不兼容；翻译的历史无元数据权重仍保持兼容。
+早期的 encoder_only 分类和句向量模式已移除。历史翻译权重只能用于 encoder_decoder，不能用于 decoder_only。
 
-## 架构说明
+## 核心概念
 
-### Decoder-only 语言模型
+### Token、词表和特殊符号
 
-Decoder-only 模型由 token embedding、位置编码、N 层因果自注意力块、前馈网络和词表投影层组成。每个位置只能关注自身及其左侧 token，因此适合自回归生成。
+模型不直接理解字符串。SentencePiece 会将文本切分为子词，并映射成整数 token ID。项目使用以下特殊 token：
 
-```text
-tokens -> Embedding + Positional Encoding
-       -> [Causal Self-Attention -> FFN] x N
-       -> LayerNorm -> Vocabulary Projection
-       -> next-token probabilities
-```
+| 名称 | ID | 作用 |
+| --- | ---: | --- |
+| PAD | 0 | 对齐 batch 中较短序列，不参与 loss |
+| UNK | 1 | 词表外 token |
+| BOS | 2 | 一段文本的开始 |
+| EOS | 3 | 一段文本的结束和默认生成停止标志 |
 
-训练时，序列 `[BOS, w1, w2, EOS]` 被切分为：
+### Decoder-only 为什么可以生成
 
-```text
-输入: [BOS, w1, w2]
-目标: [w1,  w2, EOS]
-```
+Decoder-only 使用因果注意力。位置 i 只能读取位置 0 到 i，不能读取未来 token。
 
-损失函数为忽略 `<pad>` 的 token 级交叉熵。推理时，每一步将新 token 拼接回输入，直到生成 `<eos>` 或达到 `decoder_only_max_new_tokens`。
+~~~text
+完整序列: [BOS, w1, w2, EOS]
+模型输入: [BOS, w1, w2]
+训练标签: [w1,  w2, EOS]
+~~~
 
-## 环境要求
+模型结构：
 
-- Python 3.10 或更高版本
-- Windows CPU：安装 CPU 版 PyTorch 即可
-- GPU 服务器：NVIDIA 驱动、CUDA 兼容的 PyTorch 和可见 GPU
+~~~text
+token IDs
+  -> Embedding + Positional Encoding
+  -> Causal Self-Attention + Feed Forward Network，重复 N 层
+  -> LayerNorm
+  -> 词表投影
+  -> 下一个 token 的概率
+~~~
 
-CPU 安装示例：
+推理时，模型预测一个 token 后将它追加到输入，再继续预测，直到输出 EOS 或达到 max_new_tokens。
 
-```powershell
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
-```
+### Loss 与 Perplexity
 
-GPU 服务器请从 [PyTorch 安装页](https://pytorch.org/get-started/locally/) 选择与驱动/CUDA 匹配的安装命令，然后安装其余依赖：
+训练使用忽略 PAD 的 token 级交叉熵 loss。loss 越低，通常代表模型给正确下一个 token 的概率越高。
 
-```powershell
-pip install -r requirements.txt
-```
+perplexity，简称 PPL，是 loss 的指数形式。它应与生成样例一起分析：
 
-验证运行时：
+- train loss 下降说明模型在拟合训练集。
+- dev loss 或 dev PPL 反弹，可能表示过拟合。
+- 小样例、随机初始化或训练不足时，生成无意义文本是正常现象。
 
-```powershell
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-```
+### KV Cache
 
-## 配置与运行模式
+生成阶段如果每一步都重新计算全部历史 token，会越来越慢。KV Cache 会缓存每层 Attention 已计算的 Key 和 Value：
 
-所有开关都在 `config.py`，也可使用环境变量覆盖。最常用的变量如下：
+~~~text
+第一次: prompt -> hidden states + KV Cache
+后续步: 新 token + KV Cache -> 新结果 + 更新后的 KV Cache
+~~~
 
-```python
-runtime_profile = "windows_cpu"       # windows_cpu | gpu_server | auto
-model_architecture = "decoder_only"   # decoder_only | encoder_decoder
-model_preset = "base"                 # base | small | smoke_test
-```
+本项目的批量生成已实现 KV Cache。它适合学习与小规模服务，但不是完整的大规模推理引擎。
 
-| `runtime_profile` | 行为 | 适用场景 |
+## 五分钟跑通
+
+以下步骤使用 CPU、仓库小样例和 smoke_test 小模型，只用于确认环境和流程。
+
+### 1. 进入目录
+
+~~~powershell
+cd D:\00_tranformer\Transformer-pytorch
+~~~
+
+### 2. 安装依赖
+
+~~~powershell
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+~~~
+
+### 3. 选择运行模式
+
+~~~powershell
+$env:TRANSFORMER_PROFILE = "windows_cpu"
+$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
+$env:TRANSFORMER_MODEL_PRESET = "smoke_test"
+~~~
+
+### 4. 训练
+
+~~~powershell
+python main.py --action train
+~~~
+
+smoke_test 会读取 data/json/decoder_only_train.json。训练输出位于 run/train/exp*/weights。
+
+### 5. 评估
+
+请把路径改为本机实际产生的检查点路径：
+
+~~~powershell
+$env:TRANSFORMER_INFERENCE_CHECKPOINT = "run/train/exp/weights/best_loss.pth"
+python main.py --action evaluate
+~~~
+
+### 6. 生成
+
+~~~powershell
+python translate.py
+~~~
+
+输入一句 prompt 后回车生成；直接输入空行退出。小样例模型不会生成高质量内容，这是预期行为。
+
+## 安装环境
+
+### 运行要求
+
+- Python 3.10 或更高版本。
+- Windows CPU 可以直接运行。
+- GPU 服务器需要 NVIDIA 驱动、CUDA 兼容的 PyTorch 和可见 GPU。
+- 推荐使用虚拟环境，避免污染系统 Python。
+
+### Windows CPU
+
+~~~powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+~~~
+
+### GPU 服务器
+
+先从 [PyTorch 官方安装页](https://pytorch.org/get-started/locally/) 选择与驱动和 CUDA 匹配的 PyTorch 安装命令，再安装项目依赖。
+
+~~~powershell
+python -m pip install -r requirements.txt
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+~~~
+
+只有 torch.cuda.is_available 输出 True 时才应使用 gpu_server。
+
+### 依赖用途
+
+| 依赖 | 用途 |
+| --- | --- |
+| torch | 模型、训练和 CPU/GPU 计算 |
+| sentencepiece | 中英文子词分词 |
+| sacrebleu | 翻译 BLEU 指标 |
+| tqdm | 进度条 |
+| tensorboard | 曲线可视化 |
+| fastapi、uvicorn | HTTP 推理服务 |
+
+## 配置系统
+
+默认配置位于 config.py。短期实验优先使用环境变量，长期固定实验可直接修改 config.py。
+
+### 设备配置
+
+| TRANSFORMER_PROFILE | 行为 | 适用环境 |
 | --- | --- | --- |
-| `windows_cpu` | 强制使用 CPU | Windows 本地电脑、功能验证 |
-| `gpu_server` | 强制使用 CUDA；无 GPU 时明确报错 | 单机 GPU 服务器 |
-| `auto` | 检测到 CUDA 则用 GPU，否则用 CPU | 同一份代码跨环境运行 |
+| windows_cpu | 强制 CPU | 本地电脑、功能验证 |
+| gpu_server | 强制 CUDA；没有 CUDA 时立即报错 | GPU 服务器 |
+| auto | 有 CUDA 用 GPU，否则 CPU | 同一代码跨机器 |
 
-| `model_preset` | `d_model` / 层数 / FFN | 建议 |
+GPU 示例：
+
+~~~powershell
+$env:TRANSFORMER_PROFILE = "gpu_server"
+$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
+python main.py --action train
+~~~
+
+多 GPU 时可在 config.py 将 gpu_server 的 use_data_parallel 改为 True。该项目使用 DataParallel，适合学习；大规模训练推荐使用 DistributedDataParallel。
+
+### 模型预设
+
+| TRANSFORMER_MODEL_PRESET | d_model | 层数 | FFN 维度 | 建议 |
+| --- | ---: | ---: | ---: | --- |
+| smoke_test | 64 | 2 | 256 | 只验证流程 |
+| small | 256 | 4 | 1024 | 资源有限实验 |
+| base | 512 | 6 | 2048 | 默认教学配置 |
+
+模型越大，CPU 时间、GPU 显存和训练成本越高。新手应先用 smoke_test 跑通，再逐步使用 small 或 base。
+
+### 高频配置项
+
+| 配置项 | 含义 | 初学建议 |
 | --- | --- | --- |
-| `base` | 512 / 6 / 2048 | 默认教学配置 |
-| `small` | 256 / 4 / 1024 | 资源有限的实验 |
-| `smoke_test` | 64 / 2 / 256 | CPU 快速功能验证，不用于效果评估 |
+| batch_size | 每次梯度更新的样本数 | CPU 从 2 或 4 开始 |
+| epoch_num | 训练目标总轮数 | 先设为 1 |
+| decoder_only_max_sequence_length | 训练文本最大 token 数 | 从 128 开始 |
+| decoder_only_context_length | 推理上下文最大 token 数 | 不应小于训练长度 |
+| decoder_only_max_new_tokens | 单次最多生成新 token 数 | 16 到 64 |
+| decoder_only_temperature | 采样温度 | 1.0 是常用起点 |
+| decoder_only_top_k | 每步候选数 | 20 到 50 常用 |
+| decoder_only_do_sample | 是否随机采样 | False 为稳定贪心结果 |
+| seed | 随机种子 | 默认 42 |
+| deterministic | 优先确定性算法 | 调试时保持 True |
 
-PowerShell 中临时切换配置：
+### 环境变量参考
 
-```powershell
+~~~powershell
+$env:TRANSFORMER_PROFILE = "windows_cpu"
+$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
+$env:TRANSFORMER_MODEL_PRESET = "smoke_test"
+$env:TRANSFORMER_ACTION = "train"
+$env:TRANSFORMER_SEED = "42"
+$env:TRANSFORMER_DETERMINISTIC = "true"
+$env:TRANSFORMER_TENSORBOARD = "true"
+$env:TRANSFORMER_INFERENCE_CHECKPOINT = "run/train/exp/weights/best_loss.pth"
+$env:TRANSFORMER_RESUME_CHECKPOINT = "run/train/exp/weights/last.pth"
+$env:TRANSFORMER_STOP_TOKEN_IDS = "3,10,11"
+~~~
+
+这些变量只对当前 PowerShell 窗口有效。
+
+## 数据准备
+
+### Decoder-only 语料格式
+
+支持 UTF-8 纯文本和 JSON。
+
+纯文本中每个非空行是一条独立文档：
+
+~~~text
+transformers predict the next token
+causal masks hide future information
+~~~
+
+JSON 必须是数组，元素可以是字符串或包含 text 字段的对象：
+
+~~~json
+[
+  "transformers predict the next token",
+  {"text": "causal masks hide future information"}
+]
+~~~
+
+不要把翻译的二维数组直接交给 decoder-only。翻译数据应使用 encoder_decoder 流程。
+
+### 数据清洗与统计
+
+DecoderOnlyDataset 会：
+
+1. 折叠多余空白。
+2. 丢弃空文本。
+3. 丢弃长度小于 decoder_only_min_characters 的文本。
+4. 当 decoder_only_deduplicate 为 True 时移除完全重复文本。
+5. 记录原始数、保留数、丢弃原因与字符长度分布。
+
+这不是完整的数据合规工具。它不会识别近似重复、隐私信息、版权状态、数据泄漏或语义质量。请只使用有合法授权的语料。
+
+### 固定切分真实语料
+
+建议从原始语料一次性生成固定的 train、dev、test，避免同一文本同时进入训练和评估。
+
+~~~powershell
+python tools/prepare_lm_data.py --input data/my_corpus.txt --output-dir data/my_lm_split --dev-ratio 0.05 --test-ratio 0.05 --seed 42 --min-characters 2
+~~~
+
+输出：
+
+~~~text
+data/my_lm_split/
+  train.json
+  dev.json
+  test.json
+  dataset_report.json
+~~~
+
+dataset_report.json 包含清洗统计、随机种子和每个切分的文档数。相同输入和相同 seed 会得到相同的切分。
+
+然后在 config.py 中设置三个 decoder_only 数据路径，并选择匹配的分词器：
+
+~~~python
+decoder_only_train_data_path = data_dir / "my_lm_split" / "train.json"
+decoder_only_dev_data_path = data_dir / "my_lm_split" / "dev.json"
+decoder_only_test_data_path = data_dir / "my_lm_split" / "test.json"
+decoder_only_tokenizer = "english"
+~~~
+
+中文语料请使用 chinese 分词器。词表和语料语言不匹配会严重影响结果。
+
+## Decoder-only 训练与评估
+
+### 训练流程
+
+~~~powershell
 $env:TRANSFORMER_PROFILE = "windows_cpu"
 $env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
 $env:TRANSFORMER_MODEL_PRESET = "smoke_test"
 python main.py --action train
-```
-
-`smoke_test` 会自动使用仓库内的小型 `decoder_only_train.json` 样例；`base` 和 `small` 默认读取 `data/corpus.en`。可在 `config.py` 将 `decoder_only_*_data_path` 指向自己的数据集。
-
-## Decoder-only：训练、评估与生成
-
-### 数据格式
-
-支持两种 UTF-8 数据格式，每一行或每一项是一条独立训练文本。
-
-纯文本：
-
-```text
-transformers predict the next token
-causal masks hide future tokens
-```
-
-JSON：
-
-```json
-[
-  "transformers predict the next token",
-  {"text": "causal masks hide future tokens"}
-]
-```
-
-选择与语料一致的 SentencePiece 分词器：
-
-```python
-decoder_only_tokenizer = "english"  # 或 "chinese"
-decoder_only_max_sequence_length = 128
-```
-
-读取数据时会折叠多余空白、过滤过短文本并按配置去重。训练启动时会记录原始/保留文档数、重复和空文本丢弃数、字符长度分布，便于在训练前发现语料问题。
-
-### 可复现数据切分
-
-对自己的原始语料，先生成固定且互不重叠的训练、验证和测试集：
-
-~~~powershell
-python tools/prepare_lm_data.py --input data/my_corpus.txt --output-dir data/my_lm_split --dev-ratio 0.05 --test-ratio 0.05 --seed 42
 ~~~
 
-该命令支持纯文本和本项目的 decoder-only JSON，输出 train.json、dev.json、test.json 及 dataset_report.json。报告记录清洗结果、随机种子和每个切分的样本数。随后在 config.py 设置三个 decoder_only 数据路径。
+内部流程：
 
-### 训练和评估
+~~~text
+加载和清洗文本
+  -> SentencePiece 编码
+  -> 组成 batch、补齐 PAD
+  -> 构造因果 attention mask
+  -> 预测下一个 token
+  -> 忽略 PAD 计算交叉熵
+  -> Adam 和 Noam 学习率更新
+  -> 在 dev 集计算 loss 和 PPL
+  -> 保存检查点和实验指标
+~~~
 
-```powershell
+### 评估
+
+评估不会更新参数：
+
+~~~powershell
 $env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
-python main.py --action train
+$env:TRANSFORMER_MODEL_PRESET = "smoke_test"
+$env:TRANSFORMER_INFERENCE_CHECKPOINT = "run/train/exp/weights/best_loss.pth"
 python main.py --action evaluate
-```
+~~~
 
-每次训练会在 `run/train/exp*/weights/` 写入：
+输出含有 test_loss 和 test_perplexity。test 集不应参与训练。
 
-- `best_loss.pth`：开发集 token loss 最低的检查点
-- `last.pth`：当前训练最后一个 epoch 的检查点
+### 实验目录和 TensorBoard
 
-评估或生成前，把 `inference_model_path` 设置为需要加载的 `decoder_only` 检查点。检查点保存架构元数据，加载时会拒绝错误架构，避免将翻译权重误用为语言模型权重。
+每次训练会创建 run/train/exp、run/train/exp1 等目录：
 
-每个实验目录还包含：
-
-- config.json：完整配置快照，可复现模型结构、数据路径、随机种子和运行环境。
-- metrics.jsonl：逐 epoch 的结构化指标，易于脚本分析。
-- tensorboard/：TensorBoard event 文件，记录 loss、perplexity、学习率和单 epoch 耗时。
+| 文件或目录 | 用途 |
+| --- | --- |
+| weights/best_loss.pth | dev loss 最低的模型 |
+| weights/last.pth | 最后一个 epoch，适合续训 |
+| config.json | 本次实验配置快照 |
+| metrics.jsonl | 每个 epoch 一行 JSON 指标 |
+| tensorboard/ | TensorBoard event 文件 |
 
 启动 TensorBoard：
 
 ~~~powershell
-tensorboard --logdir run/train
+python -m tensorboard.main --logdir run/train
 ~~~
 
-Decoder-only 的评估会同时输出 token loss 和 **perplexity**。perplexity 越低，代表模型对验证/测试文本的平均预测不确定性越低；它应与生成样例一起观察，不能单独代表生成质量。
+可查看 train loss、dev loss、perplexity、学习率和 epoch 耗时。
 
-训练默认使用 seed=42 和确定性模式。通过环境变量调整：
+### 可复现训练
+
+训练会设置 Python、NumPy、PyTorch 和 DataLoader 的随机源：
 
 ~~~powershell
 $env:TRANSFORMER_SEED = "123"
 $env:TRANSFORMER_DETERMINISTIC = "true"
-~~~
-
-断点续训会恢复模型参数、Adam 状态、Noam 学习率步数和已完成 epoch。epoch_num 表示目标总 epoch，必须大于断点的已完成 epoch：
-
-~~~powershell
-$env:TRANSFORMER_RESUME_CHECKPOINT = "run/train/exp/weights/last.pth"
-$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
 python main.py --action train
 ~~~
 
-评估或生成前，将 inference_model_path 或 TRANSFORMER_INFERENCE_CHECKPOINT 设置为需要加载的 decoder_only 检查点。检查点保存架构元数据，加载时会拒绝错误架构，避免将翻译权重误用为语言模型权重。
+不同 GPU、驱动和 PyTorch 版本仍可能造成细微数值差异。确定性模式主要用于调试和公平对比实验。
 
-### Python 生成接口
+### 断点续训
 
-```python
-from translate import build_inference_model, one_sentence_generate
+last.pth 会保存模型、架构、epoch、指标、Adam 状态和 Noam 调度状态。epoch_num 表示目标总 epoch，不是额外训练 epoch。
+
+~~~powershell
+$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
+$env:TRANSFORMER_MODEL_PRESET = "smoke_test"
+$env:TRANSFORMER_RESUME_CHECKPOINT = "run/train/exp/weights/last.pth"
+python main.py --action train
+~~~
+
+例如 checkpoint 已完成 epoch 1，epoch_num 为 3，程序会从 epoch 2 继续至 epoch 3。模型架构、尺寸或学习率计划不匹配时会拒绝恢复。
+
+## Decoder-only 生成与服务
+
+### 命令行生成
+
+~~~powershell
+$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
+$env:TRANSFORMER_MODEL_PRESET = "smoke_test"
+$env:TRANSFORMER_INFERENCE_CHECKPOINT = "run/train/exp/weights/best_loss.pth"
+python translate.py
+~~~
+
+### Python 单条与批量生成
+
+~~~python
+from translate import build_inference_model, one_sentence_generate, generate_texts
 
 model = build_inference_model()
-text = one_sentence_generate(
+print(one_sentence_generate(
     "transformers",
     model,
     max_new_tokens=40,
     temperature=0.8,
     top_k=20,
     do_sample=True,
-)
-print(text)
-```
+    seed=123,
+))
 
-- `do_sample=False`：贪心解码，结果可复现。
-- `do_sample=True`：从 top-k 分布采样，输出更多样。
-- `temperature` 必须大于 0；较低值更保守，较高值更发散。
-
-也可运行交互式推理：
-
-```powershell
-python translate.py
-```
-
-### 批量生成与 KV Cache
-
-批量推理接口会为同一批 prompt 复用一次前向预填充，并在后续每一步复用每层 Attention 的 KV Cache，避免反复计算完整历史上下文：
-
-~~~python
-from translate import build_inference_model, generate_texts
-
-model = build_inference_model()
 print(generate_texts(
     ["transformers", "pytorch"],
     model,
     max_new_tokens=32,
-    do_sample=True,
     top_k=20,
+    do_sample=True,
     seed=123,
 ))
 ~~~
 
-seed 可使采样结果可复现；stop_token_ids 可传入额外停止 token ID，EOS 始终会停止生成。模型会检查 prompt 长度加 max_new_tokens 是否超过 decoder_only_context_length，超过上下文窗口时直接报错，而不会静默截断生成。
+| 参数 | 含义 |
+| --- | --- |
+| max_new_tokens | 最多生成多少新 token |
+| temperature | 采样温度，必须大于 0 |
+| top_k | 只保留概率最高的 k 个候选；0 或 None 表示不截断 |
+| do_sample | False 为贪心；True 为随机采样 |
+| seed | 固定采样随机性 |
+| stop_token_ids | 额外停止 token ID；EOS 始终停止 |
 
-### HTTP 推理服务
+生成会检查 prompt token 数加 max_new_tokens 是否超过 decoder_only_context_length。超过时请缩短 prompt、降低生成长度或提高上下文配置。
 
-服务一次加载模型，并提供批量 POST /generate 接口：
+### HTTP 服务
+
+服务只支持 decoder_only。启动时加载一次 checkpoint，后续请求复用内存中的模型：
 
 ~~~powershell
+$env:TRANSFORMER_PROFILE = "windows_cpu"
 $env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
 $env:TRANSFORMER_MODEL_PRESET = "smoke_test"
 python serve.py --checkpoint run/train/exp/weights/best_loss.pth --host 127.0.0.1 --port 8000
@@ -243,70 +469,169 @@ python serve.py --checkpoint run/train/exp/weights/best_loss.pth --host 127.0.0.
 Invoke-RestMethod http://127.0.0.1:8000/health
 ~~~
 
-生成请求：
+批量生成：
 
 ~~~powershell
-$body = @{ prompts = @("transformers", "pytorch"); max_new_tokens = 32; do_sample = $true; top_k = 20; seed = 123 } | ConvertTo-Json
+$body = @{ prompts = @("transformers", "pytorch"); max_new_tokens = 32; temperature = 0.8; top_k = 20; do_sample = $true; seed = 123 } | ConvertTo-Json
 Invoke-RestMethod http://127.0.0.1:8000/generate -Method Post -ContentType "application/json" -Body $body
 ~~~
 
-单次请求最多接收 decoder_only_server_max_batch_size 条 prompt。服务仅面向可信内网或开发环境；生产部署还应在反向代理、认证、限流、请求大小限制和进程管理之后运行。
+请求 JSON：
 
-## Encoder-Decoder：英译中
+~~~json
+{
+  "prompts": ["transformers", "pytorch"],
+  "max_new_tokens": 32,
+  "temperature": 0.8,
+  "top_k": 20,
+  "do_sample": true,
+  "seed": 123,
+  "stop_token_ids": [3]
+}
+~~~
 
-原翻译功能继续保留。切换配置后运行相同入口：
+成功响应：
 
-```powershell
+~~~json
+{
+  "texts": ["generated text one", "generated text two"],
+  "count": 2
+}
+~~~
+
+单次请求上限由 decoder_only_server_max_batch_size 控制，默认 16。服务没有认证、限流、TLS 或生产级调度，不应直接暴露到公网。
+
+## Encoder-Decoder 翻译
+
+翻译功能保留，用于理解 Encoder、Decoder、交叉注意力和 Beam Search。
+
+翻译 JSON 是二维数组，每项为英文和中文：
+
+~~~json
+[
+  ["Hello world", "你好，世界"],
+  ["The model runs on a CPU.", "模型运行在 CPU 上。"]
+]
+~~~
+
+训练：
+
+~~~powershell
+$env:TRANSFORMER_PROFILE = "windows_cpu"
 $env:TRANSFORMER_MODEL_ARCHITECTURE = "encoder_decoder"
+$env:TRANSFORMER_MODEL_PRESET = "small"
 python main.py --action train
-python translate.py
-```
+~~~
 
-翻译 JSON 是二维数组，每项为 `[英文, 中文]`：
+翻译任务输出 BLEU，通常越高越好。Python 调用：
 
-```json
-[["Hello world", "你好，世界"]]
-```
-
-单句翻译接口：
-
-```python
+~~~python
 from translate import one_sentence_translate
-
 print(one_sentence_translate("The model runs on a local CPU."))
-```
+~~~
 
-## GPU 训练建议
+翻译检查点不能加载为 decoder-only，反之亦然。
 
-1. 设定 `runtime_profile = "gpu_server"` 或 `TRANSFORMER_PROFILE=gpu_server`。
-2. 确认 `torch.cuda.is_available()` 为 `True`。
-3. 根据显存调整 `batch_size`、`decoder_only_max_sequence_length` 与 `model_preset`。
-4. 多 GPU 时将 `RUNTIME_PROFILES["gpu_server"]["use_data_parallel"]` 设为 `True`。
+## 检查点、测试与验证
 
-本项目使用标准全精度训练，适合学习和中小规模实验。更大模型训练建议进一步加入混合精度、梯度累积、断点续训中的优化器状态、分布式数据并行和分片检查点。
+新检查点包含 architecture 元数据。加载时会验证架构，并优先使用 PyTorch 的 weights_only 模式。仍然只应加载可信来源的权重。
+
+运行回归测试：
+
+~~~powershell
+$env:TRANSFORMER_PROFILE = "windows_cpu"
+$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
+$env:TRANSFORMER_MODEL_PRESET = "smoke_test"
+python -m unittest discover -s tests -v
+~~~
+
+当前测试覆盖数据清洗与固定切分、KV Cache 与完整前向一致性、带 seed 的批量采样、优化器和 Noam 状态恢复。
+
+语法检查：
+
+~~~powershell
+python -m compileall -q .
+~~~
 
 ## 项目结构
 
-```text
-config.py                 运行模式、架构、路径和超参数
-main.py                   训练与评估统一入口
-translate.py              翻译与 decoder-only 生成入口
-beam_decoder.py           Encoder-Decoder 的 Beam Search
-model/tf_model.py         Transformer 基础组件和两种模型架构
-model/train_utils.py      损失计算、Noam 优化器和可恢复调度状态
-model/checkpoint_utils.py 检查点保存、加载和架构校验
-tools/data_loader.py      翻译与自回归语言模型数据集、清洗和统计
-tools/experiment.py       随机种子、配置快照、JSONL/TensorBoard 实验追踪
-tools/prepare_lm_data.py  可复现的语料清洗与 train/dev/test 切分
-serve.py                  FastAPI 批量推理服务
-tokenizer/                SentencePiece 分词器及训练脚本
-data/                     已发布语料和小型 decoder-only 样例
-weights/                  已发布的历史翻译权重（Git LFS）
-```
+~~~text
+config.py                 运行模式、路径和超参数
+main.py                   训练与评估入口
+translate.py              翻译、单条生成、批量 KV Cache 生成
+serve.py                  FastAPI 批量生成服务
+beam_decoder.py           翻译 Beam Search
 
-## 公开数据与安全
+model/
+  tf_model.py             Transformer 基础组件、两种模型、KV Cache
+  train_utils.py          loss、Noam 优化器和恢复状态
+  checkpoint_utils.py     保存、安全加载和断点恢复
 
-- 语料和现有 `.pth` 权重已随仓库公开；大权重使用 Git LFS 管理。克隆前请先执行 `git lfs install`。
-- 现有公开权重属于翻译模型，不能作为 `decoder_only` 语言模型检查点加载。请先训练新的 decoder-only 模型。
-- 请勿提交 API Key、密码、私有语料、未获授权的数据或权重。
-- 仅加载可信来源的检查点。新版本优先使用 PyTorch 的 `weights_only` 安全加载选项。
+tools/
+  data_loader.py          数据加载、清洗和统计
+  experiment.py           随机种子、配置快照、JSONL、TensorBoard
+  prepare_lm_data.py      decoder-only 语料固定切分
+  tokenizer_utils.py      SentencePiece 分词器加载
+
+tokenizer/                中英文 SentencePiece 模型和词表
+data/                     公开语料和小样例
+weights/                  历史翻译权重，使用 Git LFS
+run/                      训练实验产物
+tests/                    回归测试
+~~~
+
+## 常见问题
+
+### 没有显卡或 CUDA 报错
+
+使用 windows_cpu，不要使用 gpu_server：
+
+~~~powershell
+$env:TRANSFORMER_PROFILE = "windows_cpu"
+~~~
+
+auto 会在有 CUDA 时使用 GPU，否则使用 CPU。
+
+### 评估或生成时提示架构不匹配
+
+检查 TRANSFORMER_MODEL_ARCHITECTURE 与 checkpoint 是否同属一种架构。翻译权重只用于 encoder_decoder，语言模型权重只用于 decoder_only。
+
+### 找不到检查点
+
+训练目录可能是 exp、exp1、exp2。先查看 run/train 下实际目录，再把完整路径传给 TRANSFORMER_INFERENCE_CHECKPOINT 或 serve.py 的 checkpoint 参数。
+
+### loss 高或生成无意义
+
+优先检查：
+
+1. 是否只训练了 smoke_test 小样例。
+2. 分词器是否与语料语言匹配。
+3. 语料是否过少、重复或噪声过大。
+4. 模型是否太小或训练不足。
+5. temperature 是否设置过高。
+
+先验证流程，再逐步提高高质量语料规模、训练轮数和模型大小。
+
+### 上下文超长
+
+缩短 prompt、降低 max_new_tokens，或提高 decoder_only_context_length。后者会提高 Attention 计算量和内存需求。
+
+### TensorBoard 命令找不到
+
+使用：
+
+~~~powershell
+python -m tensorboard.main --logdir run/train
+~~~
+
+## 限制、安全与发布
+
+- 本项目面向教学、小型实验和流程理解，不是完整的大模型训练或高性能推理框架。
+- 未实现混合精度、梯度累积、DistributedDataParallel、量化、流式响应、连续批处理和生产级调度。
+- 清洗逻辑只处理空白、短文本和完全重复，不保证语料合法、无偏见、无隐私或无版权风险。
+- 不要提交 API Key、密码、个人信息、未授权语料或私有权重。
+- HTTP 服务应只在可信内网或受保护环境中运行。
+- 仓库的大 .pth 权重使用 Git LFS。克隆前执行 git lfs install。
+- 发布权重前应评估数据授权、隐私泄漏和模型记忆风险。
+
+推荐学习顺序：先运行 smoke_test，阅读 logs 和 TensorBoard，再准备自己的小型合法语料，最后逐步增加模型和数据规模。
