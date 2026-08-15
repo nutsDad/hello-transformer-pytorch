@@ -12,17 +12,7 @@ venv/
 Thumbs.db
 
 # Generated experiment outputs and checkpoints
-run/
-weights/
-*.pth
+# The current local corpus and .pth weights are intentionally versioned.
 *.pt
 *.ckpt
 *.log
-
-# Keep only the small encoder-only examples. Do not publish the original corpus.
-data/*
-!data/json/
-data/json/*
-!data/json/encoder_only_train.json
-!data/json/encoder_only_dev.json
-!data/json/encoder_only_test.json

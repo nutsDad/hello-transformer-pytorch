@@ -1,11 +1,11 @@
-# Transformer PyTorch：本地 CPU、阿里云与 Encoder-only
+# Transformer PyTorch：本地 CPU、GPU 云服务器与 Encoder-only
 
 这是一个基于 PyTorch 实现的教学型 Transformer 项目，支持通过配置切换两类模型：
 
 - `encoder_decoder`：英译中的 Encoder-Decoder Transformer，含训练、验证、BLEU 评估和 Beam Search 推理。
 - `encoder_only`：Encoder-only Transformer，支持文本分类训练、分类推理和句向量编码。
 
-默认运行在 Windows CPU，无需 NVIDIA 显卡；也支持阿里云 NVIDIA GPU 实例。
+默认运行在 Windows CPU，无需 NVIDIA 显卡；也支持配有 NVIDIA GPU 的云服务器。
 
 ## 快速开始
 
@@ -18,7 +18,7 @@ pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 ```
 
-阿里云 GPU：请根据实例驱动与 CUDA 版本，从 [PyTorch 官网](https://pytorch.org/get-started/locally/) 选择对应安装命令，再执行：
+GPU 云服务器：请根据实例驱动与 CUDA 版本，从 [PyTorch 官网](https://pytorch.org/get-started/locally/) 选择对应安装命令，再执行：
 
 ```powershell
 pip install -r requirements.txt
@@ -27,7 +27,7 @@ pip install -r requirements.txt
 在 `config.py` 设置运行环境和模型结构：
 
 ```python
-runtime_profile = "windows_cpu"          # windows_cpu | aliyun_gpu | auto
+runtime_profile = "windows_cpu"          # windows_cpu | gpu_server | auto
 model_architecture = "encoder_only"      # encoder_only | encoder_decoder
 ```
 
@@ -56,10 +56,10 @@ python translate.py
 | `runtime_profile` | 适用环境 | 行为 |
 | --- | --- | --- |
 | `windows_cpu` | Windows 本地，无 NVIDIA 显卡 | 强制 CPU，默认值 |
-| `aliyun_gpu` | 阿里云 NVIDIA GPU 实例 | 强制 CUDA；无可用 CUDA 时直接报错 |
+| `gpu_server` | 配有 NVIDIA GPU 的云服务器 | 强制 CUDA；无可用 CUDA 时直接报错 |
 | `auto` | 同一份代码在不同机器运行 | 有 CUDA 时使用 GPU，否则使用 CPU |
 
-多 GPU 训练时，将 `config.py` 中 `aliyun_gpu` 的 `use_data_parallel` 改为 `True`。单 GPU 与 CPU 保持 `False`。
+多 GPU 训练时，将 `config.py` 中 `gpu_server` 的 `use_data_parallel` 改为 `True`。单 GPU 与 CPU 保持 `False`。
 
 ### 模型结构
 
@@ -138,7 +138,7 @@ tokenizer/                SentencePiece 分词器及训练脚本
 
 ## 安全与发布说明
 
-- `.gitignore` 排除了完整语料、模型权重、训练输出、IDE 文件和 Python 缓存；这些文件未公开发布。
+- `.gitignore` 排除了 IDE 文件、Python 缓存和临时产物；当前语料与 `.pth` 权重会随仓库发布，权重通过 Git LFS 管理。
 - 不要提交 API Key、账号密码、私有数据或未获授权的语料和权重。
 - 仅加载可信来源的检查点。新版本优先启用 PyTorch 的 `weights_only` 安全加载选项；旧版 PyTorch 回退到兼容模式。
 - 本项目面向学习与中小规模实验。大参数量训练还需要混合精度、梯度累积、分布式并行和分片检查点等工程能力。

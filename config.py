@@ -27,8 +27,8 @@ RUNTIME_PROFILES = {
         "num_workers": 0,
         "pin_memory": False,
     },
-    # Alibaba Cloud GPU instance. It falls back to CPU only when using "auto".
-    "aliyun_gpu": {
+    # Generic CUDA GPU server profile. It falls back to CPU only when using "auto".
+    "gpu_server": {
         "device": "cuda",
         "device_index": 0,
         "use_data_parallel": False,
@@ -45,6 +45,9 @@ RUNTIME_PROFILES = {
     },
 }
 
+# Backward-compatible alias for earlier configuration files.
+RUNTIME_PROFILES["aliyun_gpu"] = RUNTIME_PROFILES["gpu_server"]
+
 if runtime_profile not in RUNTIME_PROFILES:
     raise ValueError(f"Unknown runtime_profile: {runtime_profile}")
 if model_architecture not in {"encoder_decoder", "encoder_only"}:
@@ -57,7 +60,7 @@ device_index = runtime["device_index"]
 if requested_device == "cuda":
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "runtime_profile='aliyun_gpu' requires a CUDA-enabled PyTorch installation "
+            "runtime_profile='gpu_server' requires a CUDA-enabled PyTorch installation "
             "and a visible NVIDIA GPU. Use 'windows_cpu' or 'auto' on this machine."
         )
     device = torch.device(f"cuda:{device_index}")
