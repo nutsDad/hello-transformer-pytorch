@@ -16,3 +16,5 @@ Thumbs.db
 *.pt
 *.ckpt
 *.log
+run/train/history.jsonl
+run/train/tensorboard_history/

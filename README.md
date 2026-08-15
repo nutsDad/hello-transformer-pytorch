@@ -171,7 +171,7 @@ python main.py --action train
 
 训练完成后，项目会在 run/train/exp、run/train/exp1 等目录下写入 decoder-only 检查点。
 
-### 本地交互式生成
+### 本地推理启动
 
 下面的命令自动选择最近生成的 best_loss.pth。若没有找到文件，请先完成一次训练。
 
@@ -186,6 +186,18 @@ python translate.py
 ~~~
 
 输入一条英文 prompt 后按回车生成；直接输入空行退出。当前小样例主要用于验证流程，生成结果不代表正式模型质量。
+
+这一步就是本地推理启动：translate.py 会读取 TRANSFORMER_INFERENCE_CHECKPOINT 指向的 decoder-only 权重并进入交互模式。启动前必须先设置 decoder_only 架构、与训练时一致的模型预设和有效 checkpoint 路径。
+
+也可以在 Python 中调用单条或批量推理：
+
+~~~python
+from translate import build_inference_model, one_sentence_generate, generate_texts
+
+model = build_inference_model()
+print(one_sentence_generate("transformers", model, max_new_tokens=20))
+print(generate_texts(["transformers", "pytorch"], model, max_new_tokens=20))
+~~~
 
 ### 本地评估
 
@@ -440,14 +452,26 @@ python main.py --action evaluate
 | config.json | 本次实验配置快照 |
 | metrics.jsonl | 每个 epoch 一行 JSON 指标 |
 | tensorboard/ | TensorBoard event 文件 |
+| run/train/history.jsonl | 所有 exp 实验合并后的机器可读历史 |
+| run/train/history.log | 所有 exp 实验合并后的可读训练日志 |
+| run/train/tensorboard_history/ | 跨实验连续 TensorBoard 曲线 |
 
-启动 TensorBoard：
+每次新的训练都会保留旧实验的记录，不会覆盖历史。查看全部历史训练日志：
 
 ~~~powershell
-python -m tensorboard.main --logdir run/train
+Get-Content .\run\train\history.log
+Get-Content .\run\train\history.log -Tail 50
 ~~~
 
-可查看 train loss、dev loss、perplexity、学习率和 epoch 耗时。
+history.jsonl 适合脚本、Notebook 或数据分析工具读取；history.log 适合在 PowerShell 直接查看。
+
+查看跨实验的连续曲线：
+
+~~~powershell
+python -m tensorboard.main --logdir run\train\tensorboard_history
+~~~
+
+可查看包含历史实验的 train loss、dev loss、perplexity、学习率和 epoch 耗时。若要按单个实验分别比较，也可使用 python -m tensorboard.main --logdir run\train。
 
 ### 可复现训练
 
@@ -691,7 +715,7 @@ auto 会在有 CUDA 时使用 GPU，否则使用 CPU。
 使用：
 
 ~~~powershell
-python -m tensorboard.main --logdir run/train
+python -m tensorboard.main --logdir run\train\tensorboard_history
 ~~~
 
 ## 限制、安全与发布

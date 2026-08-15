@@ -1,5 +1,6 @@
 """Regression tests for the decoder-only training and inference additions."""
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from model.checkpoint_utils import restore_training_checkpoint, save_checkpoint
 from model.tf_model import make_decoder_only_model
 from model.train_utils import get_std_opt
 from tools.data_loader import clean_decoder_only_texts
+from tools.experiment import ExperimentTracker
 from tools.prepare_lm_data import split_items
 from translate import generate_batch_tokens
 
@@ -110,6 +112,33 @@ class DecoderOnlyFeatureTests(unittest.TestCase):
             )
         self.assertEqual(metadata["epoch"], 1)
         self.assertEqual(restored_optimizer._step, optimizer._step)
+
+    def test_history_logs_include_multiple_experiments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            train_dir = Path(directory) / "train"
+            first = ExperimentTracker(
+                train_dir / "exp",
+                {"model_architecture": "decoder_only"},
+                enable_tensorboard=False,
+            )
+            first.log_epoch(1, {"train/loss": 2.0, "dev/loss": 1.5})
+            first.close()
+            second = ExperimentTracker(
+                train_dir / "exp1",
+                {"model_architecture": "decoder_only"},
+                enable_tensorboard=False,
+            )
+            second.log_epoch(1, {"train/loss": 1.0, "dev/loss": 0.8})
+            second.close()
+
+            history = [
+                json.loads(line)
+                for line in (train_dir / "history.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([record["experiment"] for record in history], ["exp", "exp1"])
+            text_history = (train_dir / "history.log").read_text(encoding="utf-8")
+            self.assertIn("experiment=exp", text_history)
+            self.assertIn("experiment=exp1", text_history)
 
 
 if __name__ == "__main__":
