@@ -9,14 +9,15 @@
 1. 项目功能
 2. 核心概念
 3. 五分钟跑通
-4. 安装环境
-5. 配置系统
-6. 数据准备
-7. Decoder-only 训练与评估
-8. Decoder-only 生成与服务
-9. Encoder-Decoder 翻译
-10. 实验产物、测试与排错
-11. 项目结构与限制
+4. 本地启动
+5. 安装环境
+6. 配置系统
+7. 数据准备
+8. Decoder-only 训练与评估
+9. Decoder-only 生成与服务
+10. Encoder-Decoder 翻译
+11. 实验产物、测试与排错
+12. 项目结构与限制
 
 ## 项目功能
 
@@ -148,6 +149,75 @@ python translate.py
 ~~~
 
 输入一句 prompt 后回车生成；直接输入空行退出。小样例模型不会生成高质量内容，这是预期行为。
+
+## 本地启动
+
+本节给出 Windows 本地电脑的完整启动流程。新手建议先使用 CPU 与 smoke_test，确认所有链路正常后再替换真实语料和更大的模型。
+
+### 第一次启动
+
+在 PowerShell 中执行：
+
+~~~powershell
+cd D:\00_tranformer\Transformer-pytorch
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+
+$env:TRANSFORMER_PROFILE = "windows_cpu"
+$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
+$env:TRANSFORMER_MODEL_PRESET = "smoke_test"
+python main.py --action train
+~~~
+
+训练完成后，项目会在 run/train/exp、run/train/exp1 等目录下写入 decoder-only 检查点。
+
+### 本地交互式生成
+
+下面的命令自动选择最近生成的 best_loss.pth。若没有找到文件，请先完成一次训练。
+
+~~~powershell
+$env:TRANSFORMER_INFERENCE_CHECKPOINT = (
+  Get-ChildItem .\run\train -Recurse -Filter best_loss.pth |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+).FullName
+
+python translate.py
+~~~
+
+输入一条英文 prompt 后按回车生成；直接输入空行退出。当前小样例主要用于验证流程，生成结果不代表正式模型质量。
+
+### 本地评估
+
+~~~powershell
+python main.py --action evaluate
+~~~
+
+程序会输出 test_loss 和 test_perplexity。评估依赖上一步设置的 TRANSFORMER_INFERENCE_CHECKPOINT。
+
+### 本地 HTTP 服务
+
+在保持上述环境变量的 PowerShell 窗口中运行：
+
+~~~powershell
+python serve.py --checkpoint $env:TRANSFORMER_INFERENCE_CHECKPOINT --host 127.0.0.1 --port 8000
+~~~
+
+另开一个 PowerShell 窗口验证：
+
+~~~powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+~~~
+
+服务运行时按 Ctrl+C 停止。默认仅监听本机地址 127.0.0.1，不会暴露到局域网或公网。
+
+### 本地查看训练曲线
+
+~~~powershell
+python -m tensorboard.main --logdir run\train
+~~~
+
+打开命令输出的本地浏览器地址，可查看 loss、perplexity、学习率和 epoch 耗时。
 
 ## 安装环境
 
