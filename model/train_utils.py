@@ -49,6 +49,25 @@ class NoamOpt:
             * min(step ** -0.5, step * self.warmup ** -1.5)
         )
 
+    def state_dict(self):
+        """Return optimizer and scheduler state for exact training resumption."""
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "step": self._step,
+            "rate": self._rate,
+            "warmup": self.warmup,
+            "factor": self.factor,
+            "model_size": self.model_size,
+        }
+
+    def load_state_dict(self, state_dict):
+        """Restore state saved by state_dict."""
+        self.optimizer.load_state_dict(state_dict["optimizer"])
+        self._step = state_dict["step"]
+        self._rate = state_dict["rate"]
+        if state_dict["warmup"] != self.warmup or state_dict["model_size"] != self.model_size:
+            raise ValueError("Checkpoint optimizer schedule does not match the current model.")
+
 
 def get_std_opt(model, factor=1.0, warmup=10000):
     """Create the original Noam optimizer for any model in this project."""

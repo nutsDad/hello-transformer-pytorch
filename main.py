@@ -2,6 +2,8 @@
 
 import argparse
 import logging
+import math
+import time
 from pathlib import Path
 
 import sacrebleu
@@ -11,10 +13,15 @@ from tqdm import tqdm
 
 import config
 from beam_decoder import beam_search
-from model.checkpoint_utils import load_checkpoint, save_checkpoint
+from model.checkpoint_utils import (
+    load_checkpoint,
+    restore_training_checkpoint,
+    save_checkpoint,
+)
 from model.tf_model import make_decoder_only_model, make_model
 from model.train_utils import TokenLossCompute, get_std_opt
 from tools.data_loader import DecoderOnlyDataset, MTDataset
+from tools.experiment import ExperimentTracker, config_snapshot, set_random_seed
 from tools.tokenizer_utils import chinese_tokenizer_load
 
 
@@ -32,6 +39,10 @@ def make_dataloader(dataset, shuffle):
         "num_workers": config.num_workers,
         "pin_memory": config.pin_memory,
     }
+    if shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(config.seed)
+        kwargs["generator"] = generator
     if config.num_workers > 0:
         kwargs["persistent_workers"] = True
     return DataLoader(dataset, **kwargs)
@@ -65,7 +76,7 @@ def build_model():
     )
 
 
-def create_weights_folder():
+def create_experiment_folder():
     train_dir = Path(config.run_dir) / "train"
     train_dir.mkdir(parents=True, exist_ok=True)
     index = 0
@@ -73,10 +84,38 @@ def create_weights_folder():
         name = "exp" if index == 0 else f"exp{index}"
         folder = train_dir / name
         if not folder.exists():
-            weights = folder / "weights"
-            weights.mkdir(parents=True)
-            return weights
+            (folder / "weights").mkdir(parents=True)
+            return folder
         index += 1
+
+
+def metric_perplexity(loss):
+    """Convert average negative log likelihood to a bounded perplexity value."""
+    return math.exp(min(loss, 20.0))
+
+
+def resume_training_if_requested(model, optimizer, architecture):
+    """Restore training state when TRANSFORMER_RESUME_CHECKPOINT is configured."""
+    if not config.resume_checkpoint_path:
+        return 1, {}
+    metadata = restore_training_checkpoint(
+        config.resume_checkpoint_path,
+        model,
+        config.device,
+        architecture,
+        optimizer,
+    )
+    completed_epoch = metadata.get("epoch")
+    if completed_epoch is None:
+        raise ValueError("Resume checkpoint has no epoch metadata.")
+    start_epoch = completed_epoch + 1
+    if start_epoch > config.epoch_num:
+        raise ValueError(
+            f"Resume checkpoint completed epoch {completed_epoch}, but epoch_num is "
+            f"{config.epoch_num}. Increase epoch_num to continue."
+        )
+    logging.info("Resuming %s training at epoch %d", architecture, start_epoch)
+    return start_epoch, metadata.get("metrics", {})
 
 
 def run_translation_epoch(data, model, loss_compute):
@@ -119,45 +158,70 @@ def train_translation(model):
         reduction="sum",
     )
     optimizer = get_std_opt(model)
-    weights_folder = create_weights_folder()
-    best_bleu = float("-inf")
+    experiment_dir = create_experiment_folder()
+    weights_folder = experiment_dir / "weights"
+    snapshot = config_snapshot(config)
+    tracker = ExperimentTracker(experiment_dir, snapshot, config.enable_tensorboard)
+    start_epoch, resumed_metrics = resume_training_if_requested(
+        model, optimizer, "encoder_decoder"
+    )
+    best_bleu = resumed_metrics.get("best_bleu", float("-inf"))
 
-    for epoch in range(1, config.epoch_num + 1):
-        model.train()
-        train_loss = run_translation_epoch(
-            train_data,
-            parallel_model,
-            TokenLossCompute(model.generator, criterion, optimizer),
-        )
-        model.eval()
-        with torch.no_grad():
-            dev_loss = run_translation_epoch(
-                dev_data,
+    try:
+        for epoch in range(start_epoch, config.epoch_num + 1):
+            epoch_start = time.perf_counter()
+            model.train()
+            train_loss = run_translation_epoch(
+                train_data,
                 parallel_model,
-                TokenLossCompute(model.generator, criterion),
+                TokenLossCompute(model.generator, criterion, optimizer),
             )
-        bleu = translation_bleu(dev_data, model)
-        logging.info(
-            "epoch=%d train_loss=%.4f dev_loss=%.4f bleu=%.2f",
-            epoch,
-            train_loss,
-            dev_loss,
-            bleu,
-        )
-        if bleu > best_bleu:
-            best_bleu = bleu
+            model.eval()
+            with torch.no_grad():
+                dev_loss = run_translation_epoch(
+                    dev_data,
+                    parallel_model,
+                    TokenLossCompute(model.generator, criterion),
+                )
+            bleu = translation_bleu(dev_data, model)
+            metrics = {
+                "train/loss": train_loss,
+                "dev/loss": dev_loss,
+                "dev/bleu": bleu,
+                "optimizer/lr": optimizer._rate,
+                "epoch_seconds": time.perf_counter() - epoch_start,
+                "best_bleu": max(best_bleu, bleu),
+            }
+            tracker.log_epoch(epoch, metrics)
+            logging.info(
+                "epoch=%d train_loss=%.4f dev_loss=%.4f bleu=%.2f",
+                epoch,
+                train_loss,
+                dev_loss,
+                bleu,
+            )
+            if bleu > best_bleu:
+                best_bleu = bleu
+                save_checkpoint(
+                    weights_folder / "best_bleu.pth",
+                    model,
+                    "encoder_decoder",
+                    metrics,
+                    optimizer,
+                    epoch,
+                    snapshot,
+                )
             save_checkpoint(
-                weights_folder / "best_bleu.pth",
+                weights_folder / "last.pth",
                 model,
                 "encoder_decoder",
-                {"bleu": bleu, "epoch": epoch},
+                metrics,
+                optimizer,
+                epoch,
+                snapshot,
             )
-        save_checkpoint(
-            weights_folder / "last.pth",
-            model,
-            "encoder_decoder",
-            {"bleu": bleu, "epoch": epoch},
-        )
+    finally:
+        tracker.close()
 
 
 def evaluate_translation(model):
@@ -192,6 +256,7 @@ def make_decoder_only_data(path, shuffle):
         tokenizer_name=config.decoder_only_tokenizer,
         max_length=config.decoder_only_max_sequence_length,
     )
+    logging.info("decoder-only dataset path=%s statistics=%s", path, dataset.statistics)
     return make_dataloader(dataset, shuffle=shuffle)
 
 
@@ -201,43 +266,71 @@ def train_decoder_only(model):
     parallel_model = maybe_parallel(model)
     criterion = torch.nn.CrossEntropyLoss(ignore_index=config.padding_idx, reduction="sum")
     optimizer = get_std_opt(model)
-    weights_folder = create_weights_folder()
-    best_loss = float("inf")
+    experiment_dir = create_experiment_folder()
+    weights_folder = experiment_dir / "weights"
+    snapshot = config_snapshot(config)
+    tracker = ExperimentTracker(experiment_dir, snapshot, config.enable_tensorboard)
+    start_epoch, resumed_metrics = resume_training_if_requested(
+        model, optimizer, "decoder_only"
+    )
+    best_loss = resumed_metrics.get("best_loss", float("inf"))
 
-    for epoch in range(1, config.epoch_num + 1):
-        model.train()
-        train_loss = run_decoder_only_epoch(
-            train_data,
-            parallel_model,
-            TokenLossCompute(model.generator, criterion, optimizer),
-        )
-        model.eval()
-        with torch.no_grad():
-            dev_loss = run_decoder_only_epoch(
-                dev_data,
+    try:
+        for epoch in range(start_epoch, config.epoch_num + 1):
+            epoch_start = time.perf_counter()
+            model.train()
+            train_loss = run_decoder_only_epoch(
+                train_data,
                 parallel_model,
-                TokenLossCompute(model.generator, criterion),
+                TokenLossCompute(model.generator, criterion, optimizer),
             )
-        logging.info(
-            "epoch=%d train_loss=%.4f dev_loss=%.4f",
-            epoch,
-            train_loss,
-            dev_loss,
-        )
-        if dev_loss < best_loss:
-            best_loss = dev_loss
+            model.eval()
+            with torch.no_grad():
+                dev_loss = run_decoder_only_epoch(
+                    dev_data,
+                    parallel_model,
+                    TokenLossCompute(model.generator, criterion),
+                )
+            metrics = {
+                "train/loss": train_loss,
+                "train/perplexity": metric_perplexity(train_loss),
+                "dev/loss": dev_loss,
+                "dev/perplexity": metric_perplexity(dev_loss),
+                "optimizer/lr": optimizer._rate,
+                "epoch_seconds": time.perf_counter() - epoch_start,
+                "best_loss": min(best_loss, dev_loss),
+            }
+            tracker.log_epoch(epoch, metrics)
+            logging.info(
+                "epoch=%d train_loss=%.4f train_ppl=%.4f dev_loss=%.4f dev_ppl=%.4f",
+                epoch,
+                train_loss,
+                metrics["train/perplexity"],
+                dev_loss,
+                metrics["dev/perplexity"],
+            )
+            if dev_loss < best_loss:
+                best_loss = dev_loss
+                save_checkpoint(
+                    weights_folder / "best_loss.pth",
+                    model,
+                    "decoder_only",
+                    metrics,
+                    optimizer,
+                    epoch,
+                    snapshot,
+                )
             save_checkpoint(
-                weights_folder / "best_loss.pth",
+                weights_folder / "last.pth",
                 model,
                 "decoder_only",
-                {"loss": dev_loss, "epoch": epoch},
+                metrics,
+                optimizer,
+                epoch,
+                snapshot,
             )
-        save_checkpoint(
-            weights_folder / "last.pth",
-            model,
-            "decoder_only",
-            {"loss": dev_loss, "epoch": epoch},
-        )
+    finally:
+        tracker.close()
 
 
 def evaluate_decoder_only(model):
@@ -251,19 +344,22 @@ def evaluate_decoder_only(model):
             model,
             TokenLossCompute(model.generator, criterion),
         )
-    logging.info("test_loss=%.4f", loss)
+    logging.info("test_loss=%.4f test_perplexity=%.4f", loss, metric_perplexity(loss))
 
 
 def run(action=None):
     action = action or config.run_action
     if action not in {"train", "evaluate"}:
         raise ValueError("action must be 'train' or 'evaluate'")
+    set_random_seed(config.seed, config.deterministic)
     logging.info(
-        "profile=%s device=%s architecture=%s action=%s",
+        "profile=%s device=%s architecture=%s action=%s seed=%d deterministic=%s",
         config.runtime_profile,
         config.device,
         config.model_architecture,
         action,
+        config.seed,
+        config.deterministic,
     )
     model = build_model()
     if config.model_architecture == "decoder_only":

@@ -52,10 +52,16 @@ class PositionalEncoding(nn.Module):
         # 将pe矩阵以持久的buffer状态存下(不会作为要训练的参数)
         self.register_buffer('pe', pe)
 
-    def forward(self, x):
+    def forward(self, x, start_pos=0):
         # 将一个batch的句子所有词的embedding与已构建好的positional embeding相加
         # (这里按照该批次数据的最大句子长度来取对应需要的那些positional embedding值)
-        x = x + Variable(self.pe[:, :x.size(1)], requires_grad=False)
+        end_pos = start_pos + x.size(1)
+        if end_pos > self.pe.size(1):
+            raise ValueError(
+                f"Sequence end position {end_pos} exceeds positional encoding limit "
+                f"{self.pe.size(1)}."
+            )
+        x = x + Variable(self.pe[:, start_pos:end_pos], requires_grad=False)
         return self.dropout(x)
 
 """
@@ -105,7 +111,7 @@ class MultiHeadedAttention(nn.Module):
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, past_key_value=None, use_cache=False):
         if mask is not None:
             mask = mask.unsqueeze(1)
         # query的第一个维度值为batch size
@@ -114,12 +120,20 @@ class MultiHeadedAttention(nn.Module):
         # 并将结果拆成h块，然后将第二个和第三个维度值互换(具体过程见上述解析)
         query, key, value = [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
                              for l, x in zip(self.linears, (query, key, value))]
+        if past_key_value is not None:
+            past_key, past_value = past_key_value
+            if past_key.size(0) != nbatches:
+                raise ValueError("KV cache batch size does not match the query batch size.")
+            key = torch.cat([past_key, key], dim=-2)
+            value = torch.cat([past_value, value], dim=-2)
+        present_key_value = (key, value) if use_cache else None
         # 调用上述定义的attention函数计算得到h个注意力矩阵跟value的乘积，以及注意力矩阵
         x, self.attn = attention(query, key, value, mask=mask, dropout=self.dropout)
         # 将h个多头注意力矩阵concat起来（注意要先把h变回到第三维的位置）
         x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
         # 使用self.linears中构造的最后一个全连接函数来存放变换后的矩阵进行返回
-        return self.linears[-1](x)
+        output = self.linears[-1](x)
+        return (output, present_key_value) if use_cache else output
 
 """
 定义一个层归一化的类
@@ -313,7 +327,19 @@ class CausalDecoderLayer(nn.Module):
         self.feed_forward = feed_forward
         self.sublayer = clones(SublayerConnection(size, dropout), 2)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, past_key_value=None, use_cache=False):
+        if use_cache:
+            normalized = self.sublayer[0].norm(x)
+            attention_output, present_key_value = self.self_attn(
+                normalized,
+                normalized,
+                normalized,
+                mask,
+                past_key_value=past_key_value,
+                use_cache=True,
+            )
+            x = x + self.sublayer[0].dropout(attention_output)
+            return self.sublayer[1](x, self.feed_forward), present_key_value
         x = self.sublayer[0](x, lambda value: self.self_attn(value, value, value, mask))
         return self.sublayer[1](x, self.feed_forward)
 
@@ -326,34 +352,90 @@ class CausalDecoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = LayerNorm(layer.size)
 
-    def forward(self, x, mask):
-        for layer in self.layers:
-            x = layer(x, mask)
-        return self.norm(x)
+    def forward(self, x, mask, past_key_values=None, use_cache=False):
+        if past_key_values is not None and len(past_key_values) != len(self.layers):
+            raise ValueError("KV cache must contain one entry for each decoder layer.")
+        present_key_values = []
+        for index, layer in enumerate(self.layers):
+            past_key_value = None if past_key_values is None else past_key_values[index]
+            if use_cache:
+                x, present_key_value = layer(x, mask, past_key_value, use_cache=True)
+                present_key_values.append(present_key_value)
+            else:
+                x = layer(x, mask)
+        output = self.norm(x)
+        return (output, tuple(present_key_values)) if use_cache else output
 
 
 class DecoderOnlyTransformer(nn.Module):
     """Autoregressive Transformer language model with a causal attention mask."""
 
-    def __init__(self, decoder, token_embed, generator, d_model, padding_idx=0):
+    def __init__(
+        self,
+        decoder,
+        token_embed,
+        generator,
+        d_model,
+        padding_idx=0,
+        max_positions=5000,
+    ):
         super(DecoderOnlyTransformer, self).__init__()
         self.decoder = decoder
         self.token_embed = token_embed
         self.generator = generator
         self.d_model = d_model
         self.padding_idx = padding_idx
+        self.max_positions = max_positions
 
-    def make_causal_mask(self, tokens):
+    def make_causal_mask(self, tokens, past_length=0, past_key_padding_mask=None):
         sequence_length = tokens.size(1)
-        causal = torch.tril(
-            torch.ones((sequence_length, sequence_length), dtype=torch.bool, device=tokens.device)
-        ).unsqueeze(0)
-        return (tokens != self.padding_idx).unsqueeze(1) & causal
+        key_length = past_length + sequence_length
+        query_positions = past_length + torch.arange(sequence_length, device=tokens.device)
+        key_positions = torch.arange(key_length, device=tokens.device)
+        causal = (key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)).unsqueeze(0)
+        current_padding = tokens != self.padding_idx
+        if past_length:
+            if past_key_padding_mask is None:
+                past_key_padding_mask = torch.ones(
+                    (tokens.size(0), past_length), dtype=torch.bool, device=tokens.device
+                )
+            key_padding = torch.cat([past_key_padding_mask, current_padding], dim=1)
+        else:
+            key_padding = current_padding
+        return key_padding.unsqueeze(1) & causal
 
-    def forward(self, tokens, attention_mask=None):
+    def _embed(self, tokens, start_pos):
+        embeddings = self.token_embed[0](tokens)
+        return self.token_embed[1](embeddings, start_pos=start_pos)
+
+    def forward(
+        self,
+        tokens,
+        attention_mask=None,
+        past_key_values=None,
+        past_key_padding_mask=None,
+        use_cache=False,
+    ):
+        past_length = 0
+        if past_key_values is not None:
+            past_length = past_key_values[0][0].size(-2)
+        if past_length + tokens.size(1) > self.max_positions:
+            raise ValueError(
+                f"Requested context length {past_length + tokens.size(1)} exceeds "
+                f"decoder_only_context_length={self.max_positions}."
+            )
         if attention_mask is None:
-            attention_mask = self.make_causal_mask(tokens)
-        return self.decoder(self.token_embed(tokens), attention_mask)
+            attention_mask = self.make_causal_mask(
+                tokens,
+                past_length=past_length,
+                past_key_padding_mask=past_key_padding_mask,
+            )
+        return self.decoder(
+            self._embed(tokens, past_length),
+            attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
 
 def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
     c = copy.deepcopy
@@ -382,18 +464,28 @@ def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0
     return model.to(config.device)
 
 
-def make_decoder_only_model(vocab_size, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
+def make_decoder_only_model(
+    vocab_size,
+    N=6,
+    d_model=512,
+    d_ff=2048,
+    h=8,
+    dropout=0.1,
+    max_positions=None,
+):
     """Build a decoder-only causal language model."""
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-    position = PositionalEncoding(d_model, dropout)
+    max_positions = config.decoder_only_context_length if max_positions is None else max_positions
+    position = PositionalEncoding(d_model, dropout, max_len=max_positions)
     model = DecoderOnlyTransformer(
         CausalDecoder(CausalDecoderLayer(d_model, c(attn), c(ff), dropout), N),
         nn.Sequential(Embeddings(d_model, vocab_size), c(position)),
         Generator(d_model, vocab_size),
         d_model=d_model,
         padding_idx=config.padding_idx,
+        max_positions=max_positions,
     )
     for parameter in model.parameters():
         if parameter.dim() > 1:

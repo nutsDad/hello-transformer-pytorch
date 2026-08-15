@@ -2,7 +2,7 @@
 
 一个面向学习、实验和小规模训练的 PyTorch Transformer 项目。它同时保留了英译中的 Encoder-Decoder Transformer，并提供完整的 **Decoder-only 自回归语言模型**：可在 Windows CPU 上运行，也可通过配置切换到 CUDA GPU 服务器训练和推理。
 
-项目默认安全地运行在 CPU。训练、评估、检查点和交互式推理均由同一份配置驱动，便于从本地验证迁移到 GPU 环境。
+项目默认安全地运行在 CPU。训练、评估、检查点、实验日志和推理服务均由同一份配置驱动，便于从本地验证迁移到 GPU 环境。
 
 ## 功能概览
 
@@ -122,6 +122,18 @@ decoder_only_tokenizer = "english"  # 或 "chinese"
 decoder_only_max_sequence_length = 128
 ```
 
+读取数据时会折叠多余空白、过滤过短文本并按配置去重。训练启动时会记录原始/保留文档数、重复和空文本丢弃数、字符长度分布，便于在训练前发现语料问题。
+
+### 可复现数据切分
+
+对自己的原始语料，先生成固定且互不重叠的训练、验证和测试集：
+
+~~~powershell
+python tools/prepare_lm_data.py --input data/my_corpus.txt --output-dir data/my_lm_split --dev-ratio 0.05 --test-ratio 0.05 --seed 42
+~~~
+
+该命令支持纯文本和本项目的 decoder-only JSON，输出 train.json、dev.json、test.json 及 dataset_report.json。报告记录清洗结果、随机种子和每个切分的样本数。随后在 config.py 设置三个 decoder_only 数据路径。
+
 ### 训练和评估
 
 ```powershell
@@ -136,6 +148,37 @@ python main.py --action evaluate
 - `last.pth`：当前训练最后一个 epoch 的检查点
 
 评估或生成前，把 `inference_model_path` 设置为需要加载的 `decoder_only` 检查点。检查点保存架构元数据，加载时会拒绝错误架构，避免将翻译权重误用为语言模型权重。
+
+每个实验目录还包含：
+
+- config.json：完整配置快照，可复现模型结构、数据路径、随机种子和运行环境。
+- metrics.jsonl：逐 epoch 的结构化指标，易于脚本分析。
+- tensorboard/：TensorBoard event 文件，记录 loss、perplexity、学习率和单 epoch 耗时。
+
+启动 TensorBoard：
+
+~~~powershell
+tensorboard --logdir run/train
+~~~
+
+Decoder-only 的评估会同时输出 token loss 和 **perplexity**。perplexity 越低，代表模型对验证/测试文本的平均预测不确定性越低；它应与生成样例一起观察，不能单独代表生成质量。
+
+训练默认使用 seed=42 和确定性模式。通过环境变量调整：
+
+~~~powershell
+$env:TRANSFORMER_SEED = "123"
+$env:TRANSFORMER_DETERMINISTIC = "true"
+~~~
+
+断点续训会恢复模型参数、Adam 状态、Noam 学习率步数和已完成 epoch。epoch_num 表示目标总 epoch，必须大于断点的已完成 epoch：
+
+~~~powershell
+$env:TRANSFORMER_RESUME_CHECKPOINT = "run/train/exp/weights/last.pth"
+$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
+python main.py --action train
+~~~
+
+评估或生成前，将 inference_model_path 或 TRANSFORMER_INFERENCE_CHECKPOINT 设置为需要加载的 decoder_only 检查点。检查点保存架构元数据，加载时会拒绝错误架构，避免将翻译权重误用为语言模型权重。
 
 ### Python 生成接口
 
@@ -163,6 +206,51 @@ print(text)
 ```powershell
 python translate.py
 ```
+
+### 批量生成与 KV Cache
+
+批量推理接口会为同一批 prompt 复用一次前向预填充，并在后续每一步复用每层 Attention 的 KV Cache，避免反复计算完整历史上下文：
+
+~~~python
+from translate import build_inference_model, generate_texts
+
+model = build_inference_model()
+print(generate_texts(
+    ["transformers", "pytorch"],
+    model,
+    max_new_tokens=32,
+    do_sample=True,
+    top_k=20,
+    seed=123,
+))
+~~~
+
+seed 可使采样结果可复现；stop_token_ids 可传入额外停止 token ID，EOS 始终会停止生成。模型会检查 prompt 长度加 max_new_tokens 是否超过 decoder_only_context_length，超过上下文窗口时直接报错，而不会静默截断生成。
+
+### HTTP 推理服务
+
+服务一次加载模型，并提供批量 POST /generate 接口：
+
+~~~powershell
+$env:TRANSFORMER_MODEL_ARCHITECTURE = "decoder_only"
+$env:TRANSFORMER_MODEL_PRESET = "smoke_test"
+python serve.py --checkpoint run/train/exp/weights/best_loss.pth --host 127.0.0.1 --port 8000
+~~~
+
+健康检查：
+
+~~~powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+~~~
+
+生成请求：
+
+~~~powershell
+$body = @{ prompts = @("transformers", "pytorch"); max_new_tokens = 32; do_sample = $true; top_k = 20; seed = 123 } | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:8000/generate -Method Post -ContentType "application/json" -Body $body
+~~~
+
+单次请求最多接收 decoder_only_server_max_batch_size 条 prompt。服务仅面向可信内网或开发环境；生产部署还应在反向代理、认证、限流、请求大小限制和进程管理之后运行。
 
 ## Encoder-Decoder：英译中
 
@@ -205,9 +293,12 @@ main.py                   训练与评估统一入口
 translate.py              翻译与 decoder-only 生成入口
 beam_decoder.py           Encoder-Decoder 的 Beam Search
 model/tf_model.py         Transformer 基础组件和两种模型架构
-model/train_utils.py      损失计算与 Noam 优化器
+model/train_utils.py      损失计算、Noam 优化器和可恢复调度状态
 model/checkpoint_utils.py 检查点保存、加载和架构校验
-tools/data_loader.py      翻译和自回归语言模型数据集
+tools/data_loader.py      翻译与自回归语言模型数据集、清洗和统计
+tools/experiment.py       随机种子、配置快照、JSONL/TensorBoard 实验追踪
+tools/prepare_lm_data.py  可复现的语料清洗与 train/dev/test 切分
+serve.py                  FastAPI 批量推理服务
 tokenizer/                SentencePiece 分词器及训练脚本
 data/                     已发布语料和小型 decoder-only 样例
 weights/                  已发布的历史翻译权重（Git LFS）

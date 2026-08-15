@@ -13,11 +13,27 @@ import torch
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
+
+def _env_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int_list(name):
+    value = os.getenv(name, "")
+    return [int(item) for item in value.split(",") if item.strip()]
+
 # Main switches. Valid values are documented in README.md.
 runtime_profile = os.getenv("TRANSFORMER_PROFILE", "windows_cpu")
 model_architecture = os.getenv("TRANSFORMER_MODEL_ARCHITECTURE", "encoder_decoder")
 run_action = os.getenv("TRANSFORMER_ACTION", "train")
 model_preset = os.getenv("TRANSFORMER_MODEL_PRESET", "base")
+seed = int(os.getenv("TRANSFORMER_SEED", "42"))
+deterministic = _env_flag("TRANSFORMER_DETERMINISTIC", True)
+enable_tensorboard = _env_flag("TRANSFORMER_TENSORBOARD", True)
+resume_checkpoint_path = os.getenv("TRANSFORMER_RESUME_CHECKPOINT")
 
 RUNTIME_PROFILES = {
     # Safe default for any Windows computer, including machines without an NVIDIA GPU.
@@ -111,6 +127,9 @@ max_len = 60
 max_source_len = 128
 beam_size = 3
 
+# Output paths are independent from the current working directory.
+run_dir = PROJECT_DIR / "run"
+
 # Translation data and legacy checkpoint locations.
 data_dir = PROJECT_DIR / "data"
 train_data_path = data_dir / "json" / "train.json"
@@ -118,13 +137,18 @@ dev_data_path = data_dir / "json" / "dev.json"
 test_data_path = data_dir / "json" / "test.json"
 model_path = PROJECT_DIR / "weights" / "transformer_model.pth"
 test_model_path = PROJECT_DIR / "run" / "train" / "exp" / "weights" / "best_bleu_26.30.pth"
-inference_model_path = test_model_path
+inference_model_path = Path(
+    os.getenv("TRANSFORMER_INFERENCE_CHECKPOINT", str(test_model_path))
+)
 
 # Decoder-only language-model settings. A dataset can be a UTF-8 text file
 # (one document per line) or JSON containing strings / {"text": "..."} items.
 decoder_only_tokenizer = "english"  # "english" or "chinese"
 decoder_only_vocab_size = src_vocab_size
 decoder_only_max_sequence_length = 128
+decoder_only_context_length = 256
+decoder_only_min_characters = 2
+decoder_only_deduplicate = True
 decoder_only_sample_train_data_path = data_dir / "json" / "decoder_only_train.json"
 decoder_only_dev_data_path = data_dir / "json" / "decoder_only_dev.json"
 decoder_only_test_data_path = data_dir / "json" / "decoder_only_test.json"
@@ -137,6 +161,5 @@ decoder_only_max_new_tokens = 64
 decoder_only_temperature = 1.0
 decoder_only_top_k = 50
 decoder_only_do_sample = False
-
-# Output paths are independent from the current working directory.
-run_dir = PROJECT_DIR / "run"
+decoder_only_stop_token_ids = _env_int_list("TRANSFORMER_STOP_TOKEN_IDS")
+decoder_only_server_max_batch_size = 16

@@ -5,16 +5,30 @@ from pathlib import Path
 import torch
 
 
-def save_checkpoint(path, model, architecture, metrics=None):
-    """Save model state with architecture metadata for new checkpoints."""
+def save_checkpoint(
+    path,
+    model,
+    architecture,
+    metrics=None,
+    optimizer=None,
+    epoch=None,
+    config_values=None,
+):
+    """Save model, metrics, and optional training state for resumption."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    state_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    payload = {
+        "architecture": architecture,
+        "model_state_dict": state_model.state_dict(),
+        "metrics": metrics or {},
+        "epoch": epoch,
+        "config": config_values or {},
+    }
+    if optimizer is not None:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
     torch.save(
-        {
-            "architecture": architecture,
-            "model_state_dict": model.state_dict(),
-            "metrics": metrics or {},
-        },
+        payload,
         path,
     )
 
@@ -47,4 +61,15 @@ def load_checkpoint(path, model, device, expected_architecture):
         state_dict = checkpoint
         metadata = {"architecture": "encoder_decoder", "legacy": True}
     model.load_state_dict(state_dict)
+    return metadata
+
+
+def restore_training_checkpoint(path, model, device, expected_architecture, optimizer=None):
+    """Restore a metadata checkpoint and optional optimizer/scheduler state."""
+    metadata = load_checkpoint(path, model, device, expected_architecture)
+    if optimizer is not None:
+        optimizer_state = metadata.get("optimizer_state_dict")
+        if optimizer_state is None:
+            raise ValueError("Checkpoint has no optimizer state and cannot resume training.")
+        optimizer.load_state_dict(optimizer_state)
     return metadata

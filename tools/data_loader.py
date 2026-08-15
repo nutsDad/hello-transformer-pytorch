@@ -16,6 +16,50 @@ def subsequent_mask(size):
     return torch.tril(torch.ones((1, size, size), dtype=torch.bool))
 
 
+def normalize_text(text):
+    """Normalize whitespace without changing the content or case of a document."""
+    return " ".join(text.split())
+
+
+def clean_decoder_only_texts(texts, min_characters=2, deduplicate=True):
+    """Filter empty/short documents and optionally remove exact duplicates."""
+    cleaned = []
+    seen = set()
+    statistics = {
+        "raw_documents": len(texts),
+        "kept_documents": 0,
+        "dropped_empty": 0,
+        "dropped_too_short": 0,
+        "dropped_duplicates": 0,
+        "characters": 0,
+        "min_characters": 0,
+        "max_characters": 0,
+        "mean_characters": 0.0,
+    }
+    for text in texts:
+        normalized = normalize_text(text)
+        if not normalized:
+            statistics["dropped_empty"] += 1
+            continue
+        if len(normalized) < min_characters:
+            statistics["dropped_too_short"] += 1
+            continue
+        if deduplicate and normalized in seen:
+            statistics["dropped_duplicates"] += 1
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+
+    lengths = [len(text) for text in cleaned]
+    statistics["kept_documents"] = len(cleaned)
+    if lengths:
+        statistics["characters"] = sum(lengths)
+        statistics["min_characters"] = min(lengths)
+        statistics["max_characters"] = max(lengths)
+        statistics["mean_characters"] = statistics["characters"] / len(lengths)
+    return cleaned, statistics
+
+
 class Batch:
     """A machine-translation batch, moved once to the selected device."""
 
@@ -112,7 +156,14 @@ class DecoderOnlyDataset(Dataset):
     dataset must be an array of strings or ``{"text": "..."}`` items.
     """
 
-    def __init__(self, data_path, tokenizer_name="english", max_length=None):
+    def __init__(
+        self,
+        data_path,
+        tokenizer_name="english",
+        max_length=None,
+        min_characters=None,
+        deduplicate=None,
+    ):
         if tokenizer_name not in {"english", "chinese"}:
             raise ValueError("tokenizer_name must be 'english' or 'chinese'")
         self.tokenizer = (
@@ -124,7 +175,12 @@ class DecoderOnlyDataset(Dataset):
         self.pad = self.tokenizer.pad_id()
         self.bos = self.tokenizer.bos_id()
         self.eos = self.tokenizer.eos_id()
-        self.items = self._load_items(Path(data_path))
+        raw_items = self._load_items(Path(data_path))
+        self.items, self.statistics = clean_decoder_only_texts(
+            raw_items,
+            config.decoder_only_min_characters if min_characters is None else min_characters,
+            config.decoder_only_deduplicate if deduplicate is None else deduplicate,
+        )
         if not self.items:
             raise ValueError(f"Decoder-only dataset is empty: {data_path}")
 
