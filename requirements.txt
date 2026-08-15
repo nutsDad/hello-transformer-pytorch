@@ -1,5 +1,5 @@
 # Install PyTorch separately first so the CPU or CUDA build matches the target machine.
-# See README.md for Windows CPU and Alibaba Cloud commands.
+# See README.md for Windows CPU and CUDA GPU server commands.
 tqdm==4.67.1
 sentencepiece==0.2.1
 sacrebleu==2.5.1

@@ -42,7 +42,7 @@ def load_checkpoint(path, model, device, expected_architecture):
         if expected_architecture != "encoder_decoder":
             raise ValueError(
                 "A legacy checkpoint has no architecture metadata and cannot be "
-                "safely loaded as an encoder-only model. Train encoder_only first."
+                "safely loaded as a decoder-only model. Train decoder_only first."
             )
         state_dict = checkpoint
         metadata = {"architecture": "encoder_decoder", "legacy": True}

@@ -25,22 +25,6 @@ class TokenLossCompute:
         return raw_loss.detach().item()
 
 
-class ClassificationLossCompute:
-    """Cross entropy loss for the encoder-only classification task."""
-
-    def __init__(self, criterion, optimizer=None):
-        self.criterion = criterion
-        self.optimizer = optimizer
-
-    def __call__(self, logits, labels):
-        loss = self.criterion(logits, labels)
-        if self.optimizer is not None:
-            self.optimizer.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            self.optimizer.step()
-        return loss.detach().item()
-
-
 class NoamOpt:
     def __init__(self, model_size, factor, warmup, optimizer):
         self.optimizer = optimizer
@@ -67,7 +51,7 @@ class NoamOpt:
 
 
 def get_std_opt(model, factor=1.0, warmup=10000):
-    """Create the original Noam optimizer for either model architecture."""
+    """Create the original Noam optimizer for any model in this project."""
     model_size = getattr(model, "d_model", None)
     if model_size is None:
         model_size = model.src_embed[0].d_model

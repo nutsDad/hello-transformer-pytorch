@@ -1,4 +1,4 @@
-"""Datasets and batches for translation and encoder-only tasks."""
+"""Datasets and batches for translation and decoder-only language modeling."""
 
 import json
 from pathlib import Path
@@ -92,22 +92,24 @@ class MTDataset(Dataset):
         return Batch(src_text, tgt_text, src, tgt, self.PAD)
 
 
-class EncoderOnlyBatch:
-    """A labeled text batch for encoder-only training and evaluation."""
+class DecoderOnlyBatch:
+    """A next-token-prediction batch for a causal language model."""
 
-    def __init__(self, texts, tokens, labels, pad=0, device=None):
+    def __init__(self, texts, tokens, pad=0, device=None):
         device = config.device if device is None else device
         self.texts = texts
-        self.src = tokens.to(device)
-        self.src_mask = (self.src != pad).unsqueeze(-2)
-        self.labels = labels.to(device)
+        tokens = tokens.to(device)
+        self.input_tokens = tokens[:, :-1]
+        self.target_tokens = tokens[:, 1:]
+        self.attention_mask = Batch.make_std_mask(self.input_tokens, pad)
+        self.ntokens = (self.target_tokens != pad).sum()
 
 
-class EncoderOnlyDataset(Dataset):
-    """JSON text classification dataset for the encoder-only Transformer.
+class DecoderOnlyDataset(Dataset):
+    """Text dataset for decoder-only next-token prediction.
 
-    Accepted JSON items are ``{"text": "a sentence", "label": 0}`` or the
-    shorter ``["a sentence", 0]`` form. Labels must be integer class IDs.
+    A UTF-8 text file contains one training document per non-empty line. A JSON
+    dataset must be an array of strings or ``{"text": "..."}`` items.
     """
 
     def __init__(self, data_path, tokenizer_name="english", max_length=None):
@@ -116,25 +118,33 @@ class EncoderOnlyDataset(Dataset):
         self.tokenizer = (
             english_tokenizer_load() if tokenizer_name == "english" else chinese_tokenizer_load()
         )
-        self.max_length = max_length or config.max_source_len
+        self.max_length = max_length or config.decoder_only_max_sequence_length
+        if self.max_length < 2:
+            raise ValueError("decoder_only_max_sequence_length must be at least 2")
         self.pad = self.tokenizer.pad_id()
         self.bos = self.tokenizer.bos_id()
         self.eos = self.tokenizer.eos_id()
-        with Path(data_path).open("r", encoding="utf-8") as handle:
-            raw_items = json.load(handle)
-        self.items = [self._parse_item(item, index) for index, item in enumerate(raw_items)]
+        self.items = self._load_items(Path(data_path))
+        if not self.items:
+            raise ValueError(f"Decoder-only dataset is empty: {data_path}")
+
+    @classmethod
+    def _load_items(cls, data_path):
+        if data_path.suffix.lower() == ".json":
+            with data_path.open("r", encoding="utf-8") as handle:
+                raw_items = json.load(handle)
+            if not isinstance(raw_items, list):
+                raise ValueError("Decoder-only JSON data must be an array")
+            return [cls._parse_item(item, index) for index, item in enumerate(raw_items)]
+        with data_path.open("r", encoding="utf-8") as handle:
+            return [line.strip() for line in handle if line.strip()]
 
     @staticmethod
     def _parse_item(item, index):
-        if isinstance(item, dict):
-            text, label = item.get("text"), item.get("label")
-        elif isinstance(item, (list, tuple)) and len(item) == 2:
-            text, label = item
-        else:
-            raise ValueError(f"Invalid encoder-only sample at index {index}")
-        if not isinstance(text, str) or not isinstance(label, int):
-            raise ValueError(f"Sample {index} requires string 'text' and integer 'label'")
-        return text, label
+        text = item if isinstance(item, str) else item.get("text") if isinstance(item, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"Decoder-only sample {index} requires non-empty text")
+        return text
 
     def __getitem__(self, index):
         return self.items[index]
@@ -143,8 +153,7 @@ class EncoderOnlyDataset(Dataset):
         return len(self.items)
 
     def collate_fn(self, batch):
-        texts = [item[0] for item in batch]
-        labels = torch.tensor([item[1] for item in batch], dtype=torch.long)
+        texts = list(batch)
         token_lists = []
         for text in texts:
             token_ids = self.tokenizer.EncodeAsIds(text)[: max(self.max_length - 2, 0)]
@@ -154,4 +163,4 @@ class EncoderOnlyDataset(Dataset):
             batch_first=True,
             padding_value=self.pad,
         )
-        return EncoderOnlyBatch(texts, tokens, labels, self.pad)
+        return DecoderOnlyBatch(texts, tokens, self.pad)

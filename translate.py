@@ -1,26 +1,24 @@
-"""Interactive inference for both configured Transformer architectures."""
+"""Interactive inference for translation and decoder-only language modeling."""
 
 import torch
 
 import config
 from beam_decoder import beam_search
 from model.checkpoint_utils import load_checkpoint
-from model.tf_model import make_encoder_only_model, make_model
+from model.tf_model import make_decoder_only_model, make_model
 from tools.tokenizer_utils import chinese_tokenizer_load, english_tokenizer_load
 
 
 def build_inference_model(checkpoint_path=None):
     """Build and load the model selected by config.model_architecture."""
-    if config.model_architecture == "encoder_only":
-        model = make_encoder_only_model(
-            config.encoder_only_vocab_size,
-            config.encoder_only_num_labels,
+    if config.model_architecture == "decoder_only":
+        model = make_decoder_only_model(
+            config.decoder_only_vocab_size,
             config.n_layers,
             config.d_model,
             config.d_ff,
             config.n_heads,
             config.dropout,
-            config.encoder_only_pooling,
         )
     else:
         model = make_model(
@@ -78,35 +76,54 @@ def one_sentence_translate(sentence, model=None):
     return translate(_input_tokens(sentence, english_tokenizer_load()), model)
 
 
-def one_sentence_predict(sentence, model=None):
-    """Return encoder-only class ID, optional label name, and probabilities."""
-    if config.model_architecture != "encoder_only":
-        raise RuntimeError("Set model_architecture='encoder_only' before classification.")
-    model = build_inference_model() if model is None else model
-    tokenizer = english_tokenizer_load() if config.encoder_only_tokenizer == "english" else chinese_tokenizer_load()
-    src = _input_tokens(sentence, tokenizer)
+def generate_tokens(prompt_tokens, model, max_new_tokens=None, temperature=None, top_k=None, do_sample=None):
+    """Generate continuation token IDs with greedy or top-k sampling decoding."""
+    max_new_tokens = config.decoder_only_max_new_tokens if max_new_tokens is None else max_new_tokens
+    temperature = config.decoder_only_temperature if temperature is None else temperature
+    top_k = config.decoder_only_top_k if top_k is None else top_k
+    do_sample = config.decoder_only_do_sample if do_sample is None else do_sample
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
+    tokens = prompt_tokens.to(config.device)
+    generated = []
     with torch.no_grad():
-        logits = model(src, (src != config.padding_idx).unsqueeze(-2))
-        probabilities = torch.softmax(logits, dim=-1)[0].cpu().tolist()
-        label_id = int(torch.argmax(logits, dim=-1).item())
-    label_name = (
-        config.encoder_only_label_names[label_id]
-        if label_id < len(config.encoder_only_label_names)
-        else str(label_id)
+        for _ in range(max_new_tokens):
+            hidden_states = model(tokens)
+            log_probs = model.generator(hidden_states[:, -1, :]) / temperature
+            if top_k is not None and top_k > 0 and top_k < log_probs.size(-1):
+                values, _ = torch.topk(log_probs, top_k, dim=-1)
+                log_probs = log_probs.masked_fill(log_probs < values[:, [-1]], float("-inf"))
+            if do_sample:
+                next_token = torch.multinomial(torch.softmax(log_probs, dim=-1), num_samples=1)
+            else:
+                next_token = torch.argmax(log_probs, dim=-1, keepdim=True)
+            token_id = int(next_token.item())
+            if token_id == config.eos_idx:
+                break
+            generated.append(token_id)
+            tokens = torch.cat([tokens, next_token], dim=1)
+    return generated
+
+
+def one_sentence_generate(prompt, model=None, **generation_kwargs):
+    """Generate a text continuation from a prompt using the configured LM."""
+    if config.model_architecture != "decoder_only":
+        raise RuntimeError("Set model_architecture='decoder_only' before generation.")
+    model = build_inference_model() if model is None else model
+    tokenizer = (
+        english_tokenizer_load()
+        if config.decoder_only_tokenizer == "english"
+        else chinese_tokenizer_load()
     )
-    return {"label_id": label_id, "label": label_name, "probabilities": probabilities}
-
-
-def one_sentence_encode(sentence, model=None):
-    """Return the encoder-only pooled sentence embedding as a Python list."""
-    if config.model_architecture != "encoder_only":
-        raise RuntimeError("Set model_architecture='encoder_only' before embedding inference.")
-    model = build_inference_model() if model is None else model
-    tokenizer = english_tokenizer_load() if config.encoder_only_tokenizer == "english" else chinese_tokenizer_load()
-    src = _input_tokens(sentence, tokenizer)
-    with torch.no_grad():
-        vector = model(src, (src != config.padding_idx).unsqueeze(-2), return_embeddings=True)
-    return vector[0].cpu().tolist()
+    prompt_ids = tokenizer.EncodeAsIds(prompt)[: max(config.decoder_only_max_sequence_length - 1, 1)]
+    prompt_tokens = torch.tensor(
+        [[tokenizer.bos_id()] + prompt_ids], dtype=torch.long, device=config.device
+    )
+    generated_ids = generate_tokens(prompt_tokens, model, **generation_kwargs)
+    return tokenizer.decode_ids(generated_ids)
 
 
 def interactive_example():
@@ -118,7 +135,7 @@ def interactive_example():
         if config.model_architecture == "encoder_decoder":
             print(one_sentence_translate(sentence, model))
         else:
-            print(one_sentence_predict(sentence, model))
+            print(one_sentence_generate(sentence, model))
 
 
 if __name__ == "__main__":

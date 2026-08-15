@@ -12,9 +12,9 @@ from tqdm import tqdm
 import config
 from beam_decoder import beam_search
 from model.checkpoint_utils import load_checkpoint, save_checkpoint
-from model.tf_model import make_encoder_only_model, make_model
-from model.train_utils import ClassificationLossCompute, TokenLossCompute, get_std_opt
-from tools.data_loader import EncoderOnlyDataset, MTDataset
+from model.tf_model import make_decoder_only_model, make_model
+from model.train_utils import TokenLossCompute, get_std_opt
+from tools.data_loader import DecoderOnlyDataset, MTDataset
 from tools.tokenizer_utils import chinese_tokenizer_load
 
 
@@ -45,16 +45,14 @@ def maybe_parallel(model):
 
 
 def build_model():
-    if config.model_architecture == "encoder_only":
-        return make_encoder_only_model(
-            config.encoder_only_vocab_size,
-            config.encoder_only_num_labels,
+    if config.model_architecture == "decoder_only":
+        return make_decoder_only_model(
+            config.decoder_only_vocab_size,
             config.n_layers,
             config.d_model,
             config.d_ff,
             config.n_heads,
             config.dropout,
-            config.encoder_only_pooling,
         )
     return make_model(
         config.src_vocab_size,
@@ -178,88 +176,82 @@ def evaluate_translation(model):
     logging.info("test_loss=%.4f bleu=%.2f", loss, bleu)
 
 
-def run_encoder_only_epoch(data, model, loss_compute):
+def run_decoder_only_epoch(data, model, loss_compute):
     total_loss = 0.0
-    total_examples = 0
-    correct = 0
+    total_tokens = 0
     for batch in tqdm(data, leave=False):
-        logits = model(batch.src, batch.src_mask)
-        total_loss += loss_compute(logits, batch.labels) * batch.labels.size(0)
-        total_examples += batch.labels.size(0)
-        correct += (logits.argmax(dim=-1) == batch.labels).sum().item()
-    return total_loss / max(total_examples, 1), correct / max(total_examples, 1)
+        output = model(batch.input_tokens, batch.attention_mask)
+        total_loss += loss_compute(output, batch.target_tokens, batch.ntokens)
+        total_tokens += batch.ntokens.item()
+    return total_loss / max(total_tokens, 1)
 
 
-def make_encoder_only_data(path, shuffle):
-    dataset = EncoderOnlyDataset(
+def make_decoder_only_data(path, shuffle):
+    dataset = DecoderOnlyDataset(
         path,
-        tokenizer_name=config.encoder_only_tokenizer,
-        max_length=config.max_source_len,
+        tokenizer_name=config.decoder_only_tokenizer,
+        max_length=config.decoder_only_max_sequence_length,
     )
-    labels = [label for _, label in dataset.items]
-    if labels and (min(labels) < 0 or max(labels) >= config.encoder_only_num_labels):
-        raise ValueError("Encoder-only labels must be in [0, encoder_only_num_labels).")
     return make_dataloader(dataset, shuffle=shuffle)
 
 
-def train_encoder_only(model):
-    train_data = make_encoder_only_data(config.encoder_only_train_data_path, shuffle=True)
-    dev_data = make_encoder_only_data(config.encoder_only_dev_data_path, shuffle=False)
+def train_decoder_only(model):
+    train_data = make_decoder_only_data(config.decoder_only_train_data_path, shuffle=True)
+    dev_data = make_decoder_only_data(config.decoder_only_dev_data_path, shuffle=False)
     parallel_model = maybe_parallel(model)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=config.padding_idx, reduction="sum")
     optimizer = get_std_opt(model)
     weights_folder = create_weights_folder()
-    best_accuracy = float("-inf")
+    best_loss = float("inf")
 
     for epoch in range(1, config.epoch_num + 1):
         model.train()
-        train_loss, train_accuracy = run_encoder_only_epoch(
+        train_loss = run_decoder_only_epoch(
             train_data,
             parallel_model,
-            ClassificationLossCompute(criterion, optimizer),
+            TokenLossCompute(model.generator, criterion, optimizer),
         )
         model.eval()
         with torch.no_grad():
-            dev_loss, dev_accuracy = run_encoder_only_epoch(
+            dev_loss = run_decoder_only_epoch(
                 dev_data,
                 parallel_model,
-                ClassificationLossCompute(criterion),
+                TokenLossCompute(model.generator, criterion),
             )
         logging.info(
-            "epoch=%d train_loss=%.4f train_acc=%.4f dev_loss=%.4f dev_acc=%.4f",
+            "epoch=%d train_loss=%.4f dev_loss=%.4f",
             epoch,
             train_loss,
-            train_accuracy,
             dev_loss,
-            dev_accuracy,
         )
-        if dev_accuracy > best_accuracy:
-            best_accuracy = dev_accuracy
+        if dev_loss < best_loss:
+            best_loss = dev_loss
             save_checkpoint(
-                weights_folder / "best_accuracy.pth",
+                weights_folder / "best_loss.pth",
                 model,
-                "encoder_only",
-                {"accuracy": dev_accuracy, "epoch": epoch},
+                "decoder_only",
+                {"loss": dev_loss, "epoch": epoch},
             )
         save_checkpoint(
             weights_folder / "last.pth",
             model,
-            "encoder_only",
-            {"accuracy": dev_accuracy, "epoch": epoch},
+            "decoder_only",
+            {"loss": dev_loss, "epoch": epoch},
         )
 
 
-def evaluate_encoder_only(model):
-    load_checkpoint(config.inference_model_path, model, config.device, "encoder_only")
+def evaluate_decoder_only(model):
+    load_checkpoint(config.inference_model_path, model, config.device, "decoder_only")
     model.eval()
-    test_data = make_encoder_only_data(config.encoder_only_test_data_path, shuffle=False)
+    test_data = make_decoder_only_data(config.decoder_only_test_data_path, shuffle=False)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=config.padding_idx, reduction="sum")
     with torch.no_grad():
-        loss, accuracy = run_encoder_only_epoch(
+        loss = run_decoder_only_epoch(
             test_data,
             model,
-            ClassificationLossCompute(torch.nn.CrossEntropyLoss()),
+            TokenLossCompute(model.generator, criterion),
         )
-    logging.info("test_loss=%.4f test_acc=%.4f", loss, accuracy)
+    logging.info("test_loss=%.4f", loss)
 
 
 def run(action=None):
@@ -274,8 +266,8 @@ def run(action=None):
         action,
     )
     model = build_model()
-    if config.model_architecture == "encoder_only":
-        return train_encoder_only(model) if action == "train" else evaluate_encoder_only(model)
+    if config.model_architecture == "decoder_only":
+        return train_decoder_only(model) if action == "train" else evaluate_decoder_only(model)
     return train_translation(model) if action == "train" else evaluate_translation(model)
 
 

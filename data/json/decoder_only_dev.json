@@ -1,0 +1,4 @@
+[
+  {"text": "causal masks prevent a token from seeing future tokens"},
+  {"text": "the decoder generates text one token at a time"}
+]

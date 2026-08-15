@@ -1,0 +1,10 @@
+[
+  {"text": "transformers predict the next token from previous tokens"},
+  {"text": "a decoder only model uses causal self attention"},
+  {"text": "pytorch runs this language model on cpu or cuda"},
+  {"text": "the training loop minimizes next token cross entropy"},
+  {"text": "sentencepiece converts text into subword token ids"},
+  {"text": "a checkpoint stores the learned model parameters"},
+  {"text": "greedy decoding selects the most likely next token"},
+  {"text": "top k sampling creates more varied continuations"}
+]

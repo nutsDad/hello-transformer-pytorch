@@ -303,39 +303,57 @@ class Transformer(nn.Module):
         return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask)
 
 
-class EncoderOnlyTransformer(nn.Module):
-    """Transformer encoder with pooling, classification, and vector output."""
+class CausalDecoderLayer(nn.Module):
+    """A decoder block with causal self-attention and no cross-attention."""
 
-    def __init__(self, encoder, src_embed, classifier, d_model, pooling="mean"):
-        super(EncoderOnlyTransformer, self).__init__()
-        if pooling not in {"mean", "cls"}:
-            raise ValueError("pooling must be 'mean' or 'cls'")
-        self.encoder = encoder
-        self.src_embed = src_embed
-        self.classifier = classifier
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super(CausalDecoderLayer, self).__init__()
+        self.size = size
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+
+    def forward(self, x, mask):
+        x = self.sublayer[0](x, lambda value: self.self_attn(value, value, value, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
+
+class CausalDecoder(nn.Module):
+    """A stack of decoder-only Transformer blocks."""
+
+    def __init__(self, layer, N):
+        super(CausalDecoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+
+    def forward(self, x, mask):
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+
+
+class DecoderOnlyTransformer(nn.Module):
+    """Autoregressive Transformer language model with a causal attention mask."""
+
+    def __init__(self, decoder, token_embed, generator, d_model, padding_idx=0):
+        super(DecoderOnlyTransformer, self).__init__()
+        self.decoder = decoder
+        self.token_embed = token_embed
+        self.generator = generator
         self.d_model = d_model
-        self.pooling = pooling
+        self.padding_idx = padding_idx
 
-    def encode(self, src, src_mask=None):
-        if src_mask is None:
-            src_mask = (src != config.padding_idx).unsqueeze(-2)
-        return self.encoder(self.src_embed(src), src_mask)
+    def make_causal_mask(self, tokens):
+        sequence_length = tokens.size(1)
+        causal = torch.tril(
+            torch.ones((sequence_length, sequence_length), dtype=torch.bool, device=tokens.device)
+        ).unsqueeze(0)
+        return (tokens != self.padding_idx).unsqueeze(1) & causal
 
-    def pool(self, memory, src_mask):
-        if self.pooling == "cls":
-            return memory[:, 0]
-        token_mask = src_mask.squeeze(-2).unsqueeze(-1).to(memory.dtype)
-        token_count = token_mask.sum(dim=1).clamp_min(1.0)
-        return (memory * token_mask).sum(dim=1) / token_count
-
-    def embed(self, src, src_mask=None):
-        if src_mask is None:
-            src_mask = (src != config.padding_idx).unsqueeze(-2)
-        return self.pool(self.encode(src, src_mask), src_mask)
-
-    def forward(self, src, src_mask=None, return_embeddings=False):
-        embeddings = self.embed(src, src_mask)
-        return embeddings if return_embeddings else self.classifier(embeddings)
+    def forward(self, tokens, attention_mask=None):
+        if attention_mask is None:
+            attention_mask = self.make_causal_mask(tokens)
+        return self.decoder(self.token_embed(tokens), attention_mask)
 
 def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
     c = copy.deepcopy
@@ -364,19 +382,18 @@ def make_model(src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0
     return model.to(config.device)
 
 
-def make_encoder_only_model(vocab_size, num_labels, N=6, d_model=512,
-                            d_ff=2048, h=8, dropout=0.1, pooling="mean"):
-    """Build an encoder-only Transformer for classification and embeddings."""
+def make_decoder_only_model(vocab_size, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1):
+    """Build a decoder-only causal language model."""
     c = copy.deepcopy
     attn = MultiHeadedAttention(h, d_model)
     ff = PositionwiseFeedForward(d_model, d_ff, dropout)
     position = PositionalEncoding(d_model, dropout)
-    model = EncoderOnlyTransformer(
-        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
+    model = DecoderOnlyTransformer(
+        CausalDecoder(CausalDecoderLayer(d_model, c(attn), c(ff), dropout), N),
         nn.Sequential(Embeddings(d_model, vocab_size), c(position)),
-        nn.Linear(d_model, num_labels),
+        Generator(d_model, vocab_size),
         d_model=d_model,
-        pooling=pooling,
+        padding_idx=config.padding_idx,
     )
     for parameter in model.parameters():
         if parameter.dim() > 1:
